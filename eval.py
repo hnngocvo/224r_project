@@ -142,6 +142,10 @@ class MetricWrapper(gym.Wrapper):
             path_map = self.base_env.path_map
             info["path_map"] = path_map  # Add path_map to info
             
+            # ---- DEBUG PRINT ----
+            print(f"[MetricWrapper DEBUG] id(self.base_env): {id(self.base_env)}, path_map sum: {np.sum(path_map)}, path_map max: {np.max(path_map)}, path_map shape: {path_map.shape}")
+            # ---- END DEBUG PRINT ----
+
             # Compute metrics
             self.metrics['coverage_ratio'] = compute_coverage_ratio(self.base_env)
             self.metrics['path_efficiency'] = compute_redundancy_rate(self.base_env)
