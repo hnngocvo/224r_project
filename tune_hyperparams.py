@@ -27,7 +27,7 @@ register(
 # --------------------------------------
 # Make monitored, wrapped environment
 # --------------------------------------
-def make_env(grid_size=(20, 20), use_layout=False, max_steps=3000, dirt_num=0, algo='ppo', wall_mode="none"):
+def make_env(grid_size=(20, 20), use_layout=False, max_steps=3000, dirt_num=0, algo='ppo', wall_mode="random"):
     if wall_mode == "hardcoded":
         walls = generate_1b1b_layout_grid()
     elif wall_mode == "none":
@@ -143,7 +143,7 @@ if __name__ == "__main__":
     print("\nBest Trial:")
     print(study.best_trial)
 
-    save_dir = "optuna_results/dirt_num_5"
+    save_dir = "optuna_results"
     os.makedirs(save_dir, exist_ok=True)
 
     best_param_path = os.path.join(save_dir, f"{algo}_best_params.json")
