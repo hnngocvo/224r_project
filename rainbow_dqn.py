@@ -375,8 +375,20 @@ def project_distribution(next_dist, rewards, dones, support, delta_z, gamma):
     b_flat = b.flatten()
     
     # Calculate weights
-    l_weight = (u_flat - b_flat) * next_dist_flat
-    u_weight = (b_flat - l_flat) * next_dist_flat
+    # Original buggy weights:
+    # l_weight = (u_flat - b_flat) * next_dist_flat
+    # u_weight = (b_flat - l_flat) * next_dist_flat
+
+    # Corrected weights to handle integer b_flat cases
+    is_exact_match = (l_flat == u_flat)
+    
+    # Coefficient for the lower bin l
+    l_coeff = u_flat.float() - b_flat # Use .float() for b_flat to ensure float arithmetic
+    # Coefficient for the upper bin u
+    u_coeff = b_flat - l_flat.float() # Use .float() for l_flat
+
+    l_weight = torch.where(is_exact_match, torch.ones_like(l_coeff), l_coeff) * next_dist_flat
+    u_weight = torch.where(is_exact_match, torch.zeros_like(u_coeff), u_coeff) * next_dist_flat
     
     # Use scatter_add for vectorized accumulation
     proj_dist.view(-1).scatter_add_(0, batch_flat * atoms + l_flat, l_weight)
@@ -422,7 +434,7 @@ def rollout_and_record(env, policy_net, filename="rainbow_run.mp4", max_steps=MA
     plt.close(fig)
     print(f"Video saved to: {filename}")
 
-def plot_training_metrics(metrics: Dict[str, List[float]]):
+def plot_training_metrics(metrics: Dict[str, List[float]], log_dir: str):
     """Plot and save training metrics"""
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
     fig.suptitle("Rainbow DQN Training Metrics")
@@ -459,7 +471,7 @@ def plot_training_metrics(metrics: Dict[str, List[float]]):
         axes[1, 1].set_ylabel("Ratio")
 
     plt.tight_layout()
-    plt.savefig(os.path.join(LOG_DIR, "training_metrics.png"))
+    plt.savefig(os.path.join(log_dir, "training_metrics.png"))
     plt.close()
 
 def print_section_header(title):
@@ -484,41 +496,39 @@ def print_progress_bar(iteration, total, prefix='', suffix='', decimals=1, lengt
     if iteration == total:
         print()
 
-def save_model(model, filename):
+def save_model(model, full_save_path):
     """Save model state dict to file"""
-    save_path = os.path.join(LOG_DIR, filename)
     # Save model state and training info
     save_dict = {
         'state_dict': model.state_dict(),
         'device': str(next(model.parameters()).device),
         'training': model.training
     }
-    torch.save(save_dict, save_path)
-    print(f"\nModel saved to: {save_path} (device: {save_dict['device']}, training: {save_dict['training']})")
+    torch.save(save_dict, full_save_path)
+    print(f"\nModel saved to: {full_save_path} (device: {save_dict['device']}, training: {save_dict['training']})")
 
-def load_model(model, filename):
+def load_model(model, full_load_path):
     """Load model state dict from file"""
-    load_path = os.path.join(LOG_DIR, filename)
-    if os.path.exists(load_path):
+    if os.path.exists(full_load_path):
         # Load with device mapping
-        checkpoint = torch.load(load_path, map_location=device)
+        checkpoint = torch.load(full_load_path, map_location=device)
         
         if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
             model.load_state_dict(checkpoint['state_dict'])
             saved_device = checkpoint.get('device', 'unknown')
             saved_training = checkpoint.get('training', 'unknown')
-            print(f"\nModel loaded from: {load_path}")
+            print(f"\nModel loaded from: {full_load_path}")
             print(f"Original device: {saved_device}, Current device: {device}")
             print(f"Original training mode: {saved_training}, Current training mode: {model.training}")
         else:
             # Handle old format
             model.load_state_dict(checkpoint)
-            print(f"\nModel loaded from: {load_path} (old format)")
+            print(f"\nModel loaded from: {full_load_path} (old format)")
             print(f"Current device: {device}, Current training mode: {model.training}")
         
         return model
     else:
-        print(f"\nNo saved model found at: {load_path}")
+        print(f"\nNo saved model found at: {full_load_path}")
         return None
 
 def get_log_dir(grid_size, custom_dir=None):
@@ -537,9 +547,12 @@ def get_log_dir(grid_size, custom_dir=None):
     os.makedirs(log_dir, exist_ok=True)
     return log_dir
 
-def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps: int = MAX_TIMESTEPS, save_freq: int = 10000, walls=None, from_scratch=False, env=None, custom_log_dir=None, seed=None):
-    global LOG_DIR  # Make LOG_DIR accessible globally
-    LOG_DIR = get_log_dir(grid_size, custom_dir=custom_log_dir)
+def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps: int = MAX_TIMESTEPS, save_freq: int = 10000, walls=None, env=None, seed=None, output_dir: str = None, dirt_num: int = 5):
+    if output_dir is None:
+        # Fallback if no output_dir is provided, though __main__ should provide it.
+        output_dir = get_log_dir(grid_size)
+    else:
+        os.makedirs(output_dir, exist_ok=True) # Ensure it exists if provided
     
     # Set random seeds if provided
     if seed is not None:
@@ -556,8 +569,8 @@ def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps:
     print(f"Random seed: {seed}")
     
     # Initialize TensorBoard writer
-    writer = SummaryWriter(os.path.join(LOG_DIR, 'tensorboard'))
-    print(f"TensorBoard logs will be saved to: {os.path.join(LOG_DIR, 'tensorboard')}")
+    writer = SummaryWriter(os.path.join(output_dir, 'tensorboard'))
+    print(f"TensorBoard logs will be saved to: {os.path.join(output_dir, 'tensorboard')}")
     
     # Initialize reward normalizer
     reward_normalizer = RunningMeanStd(shape=())
@@ -565,7 +578,7 @@ def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps:
     # Create environment if not provided
     if env is None:
         # Create and wrap environment with metrics and additional wrappers
-        env = gym.make(env_id, grid_size=grid_size, use_counter=False, dirt_num=5)  # Add grid_size parameter
+        env = gym.make(env_id, grid_size=grid_size, use_counter=False, dirt_num=dirt_num)  # Add grid_size parameter
         env = TimeLimit(env, max_episode_steps=MAX_STEPS)
         env = ExplorationBonusWrapper(env, bonus=0.10525612628712341)  # From Optuna study
         env = ExploitationPenaltyWrapper(env, time_penalty=-0.0020989802390739463, stay_penalty=-0.05073560696895504)  # From Optuna study
@@ -607,10 +620,18 @@ def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps:
     optimizer = optim.Adam(policy_net.parameters(), lr=LR)
     
     # Try to load latest checkpoint if exists
-    latest_model = load_model(policy_net, "latest_model.pth")
-    if latest_model is not None and not from_scratch:
-        policy_net = latest_model
-        target_net.load_state_dict(policy_net.state_dict())
+    latest_model_path = os.path.join(output_dir, "latest_model.pth")
+    if os.path.exists(latest_model_path):
+        print(f"Attempting to load existing model from {latest_model_path}")
+        latest_model = load_model(policy_net, latest_model_path)
+        if latest_model is not None:
+            policy_net = latest_model
+            target_net.load_state_dict(policy_net.state_dict())
+            print("Successfully loaded existing model.")
+        else:
+            print("Failed to load existing model, starting from scratch.")
+    else:
+        print("No existing model found at specified output_dir, starting from scratch.")
     
     # Initialize replay buffer
     buffer = PrioritizedReplayBuffer(BUFFER_SIZE)
@@ -673,7 +694,7 @@ def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps:
             # Save best model if this is the best reward
             if episode_reward > best_reward:
                 best_reward = episode_reward
-                save_model(policy_net, "best_model.pth")
+                save_model(policy_net, os.path.join(output_dir, "best_model.pth"))
                 print(f"\nNew best reward: {best_reward:.2f}")
             
             # Log metrics to dictionary
@@ -752,35 +773,38 @@ def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps:
 
         # Save model periodically
         if step > 0 and step % save_freq == 0:
-            save_model(policy_net, f"model_step_{step}.pth")
-            save_model(policy_net, "latest_model.pth")  # Always keep the latest model
+            save_model(policy_net, os.path.join(output_dir, f"model_step_{step}.pth"))
+            save_model(policy_net, os.path.join(output_dir, "latest_model.pth"))  # Always keep the latest model
 
     print_section_header("Training Complete")
     print(f"Total episodes: {episode_count}")
     print("\nSaving metrics and plots...")
     
     # Save final model
-    save_model(policy_net, "final_model.pth")
+    save_model(policy_net, os.path.join(output_dir, "final_model.pth"))
     
     # Save training metrics
-    metrics_file = os.path.join(LOG_DIR, "training_metrics.json")
+    metrics_file = os.path.join(output_dir, "training_metrics.json")
     with open(metrics_file, "w") as f:
         json.dump(training_metrics, f)
 
     # Plot training metrics
-    plot_training_metrics(training_metrics)
+    plot_training_metrics(training_metrics, output_dir)
     print(f"Metrics saved to: {metrics_file}")
-    print(f"Plots saved to: {LOG_DIR}")
+    print(f"Plots saved to: {output_dir}")
     
     # Close TensorBoard writer
     writer.close()
     env.close()
     return policy_net
 
-def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=5, render=True, walls=None, env=None, custom_log_dir=None):
-    global LOG_DIR  # Make LOG_DIR accessible globally
-    LOG_DIR = get_log_dir(grid_size, custom_dir=custom_log_dir)
-    
+def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=5, render=True, walls=None, env=None, output_dir: str = None, dirt_num: int = 5):
+    if output_dir is None:
+        # Fallback if no output_dir is provided, though __main__ should provide it.
+        output_dir = get_log_dir(grid_size)
+    else:
+        os.makedirs(output_dir, exist_ok=True) # Ensure it exists if provided
+
     print_section_header("Starting Evaluation")
     print(f"Environment: {env_id}")
     print(f"Grid Size: {grid_size[0]}x{grid_size[1]}")
@@ -793,7 +817,7 @@ def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=5, rende
     # Create environment if not provided
     if env is None:
         # Create and wrap environment with same wrappers as training
-        env = gym.make(env_id, grid_size=grid_size, render_mode="plot", use_counter=False)
+        env = gym.make(env_id, grid_size=grid_size, render_mode="plot", use_counter=False, dirt_num=dirt_num)
         env = TimeLimit(env, max_episode_steps=MAX_STEPS)
         env = ExplorationBonusWrapper(env, bonus=0.10525612628712341)  # From Optuna study
         env = ExploitationPenaltyWrapper(env, time_penalty=-0.0020989802390739463, stay_penalty=-0.05073560696895504)  # From Optuna study
@@ -853,7 +877,13 @@ def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=5, rende
         print(f"Revisit Ratio: {info.get('revisit_ratio', 0):.2f}")
         
         if render:
-            video_path = os.path.join(LOG_DIR, f"eval_ep_{episodes - ep}.mp4")
+            # ---- DEBUG PRINT ----
+            if hasattr(env, 'unwrapped'):
+                print(f"[evaluate DEBUG] id(env.unwrapped) before rollout_and_record: {id(env.unwrapped)}")
+            else:
+                print(f"[evaluate DEBUG] env has no unwrapped attribute before rollout_and_record")
+            # ---- END DEBUG PRINT ----
+            video_path = os.path.join(output_dir, f"eval_ep_{episodes - ep}.mp4")
             rollout_and_record(env.unwrapped, policy_net, filename=video_path, walls=walls)
             print(f"\nSaved video: {video_path}")
 
@@ -872,7 +902,7 @@ def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=5, rende
     print_metrics(summary_metrics)
 
     # Save evaluation metrics
-    metrics_file = os.path.join(LOG_DIR, "evaluation_metrics.json")
+    metrics_file = os.path.join(output_dir, "evaluation_metrics.json")
     with open(metrics_file, "w") as f:
         json.dump(metrics, f)
     print(f"\nMetrics saved to: {metrics_file}")
@@ -885,7 +915,7 @@ if __name__ == "__main__":
     parser.add_argument('--mode', choices=['train', 'eval'], default='train',
                       help='Whether to train a new model or evaluate an existing one')
     parser.add_argument('--model_path', type=str, default='best_model.pth',
-                      help='Path to model file for evaluation (relative to LOG_DIR)')
+                      help='Path to model file for evaluation (e.g., logs/run_folder/best_model.pth or an absolute path)')
     parser.add_argument('--timesteps', type=int, default=MAX_TIMESTEPS,
                       help='Number of timesteps to train for')
     parser.add_argument('--eval_episodes', type=int, default=5,
@@ -894,14 +924,14 @@ if __name__ == "__main__":
                       help='Grid size as two integers (e.g., 6 6 for 6x6 grid)')
     parser.add_argument('--wall_mode', choices=['random', 'hardcoded'], default='random',
                       help='Wall layout: "random" or "hardcoded" (only applies to 40x30 grid)')
-    parser.add_argument('--from_scratch', action='store_true',
-                      help='Start training from scratch, ignoring any existing checkpoints')
     parser.add_argument('--seed', type=int, default=None,
                       help='Random seed for reproducibility')
+    parser.add_argument('--dirt_num', type=int, default=5,
+                      help='Number of dirt clusters to generate (0 means all non-obstacle tiles are dirt)')
     args = parser.parse_args()
 
     grid_size = tuple(args.grid_size)
-    LOG_DIR = get_log_dir(grid_size)
+    # LOG_DIR = get_log_dir(grid_size) # Removed: LOG_DIR will be determined per mode
 
     # Import hardcoded wall layout if needed
     walls = None
@@ -910,12 +940,25 @@ if __name__ == "__main__":
         walls = generate_1b1b_layout_grid()
 
     if args.mode == 'train':
+        # Determine log directory for this run
+        run_log_dir = get_log_dir(grid_size)
+        print(f"All outputs for this run will be saved to: {run_log_dir}")
+
         # Train a new model
         model = train(total_timesteps=args.timesteps, grid_size=grid_size, walls=walls, 
-                     from_scratch=args.from_scratch, seed=args.seed)
-        # Evaluate the trained model
-        evaluate(model, grid_size=grid_size, episodes=args.eval_episodes, walls=walls)
-    else:
+                     seed=args.seed, output_dir=run_log_dir, dirt_num=args.dirt_num)
+        # Evaluate the trained model, saving results in the same directory
+        evaluate(model, grid_size=grid_size, episodes=args.eval_episodes, walls=walls, output_dir=run_log_dir, dirt_num=args.dirt_num)
+    else: # args.mode == 'eval'
+        # args.model_path is expected to be a path to the model file.
+        # The directory of this file will be used for saving evaluation outputs.
+        model_load_path = os.path.abspath(args.model_path)
+        eval_output_dir = os.path.dirname(model_load_path)
+        os.makedirs(eval_output_dir, exist_ok=True) # Ensure the directory exists
+
+        print(f"Loading model from: {model_load_path}")
+        print(f"Evaluation outputs will be saved to: {eval_output_dir}")
+
         # Create a new model instance
         env = gym.make("Vacuum-v0", grid_size=grid_size)
         obs_dim = {
@@ -928,10 +971,10 @@ if __name__ == "__main__":
         env.close()
 
         # Load and evaluate the model
-        loaded_model = load_model(model, args.model_path)
+        loaded_model = load_model(model, model_load_path) # Pass full path
         if loaded_model is not None:
             # Ensure model is in evaluation mode
             loaded_model.eval()
-            evaluate(loaded_model, grid_size=grid_size, episodes=args.eval_episodes, walls=walls)
+            evaluate(loaded_model, grid_size=grid_size, episodes=args.eval_episodes, walls=walls, output_dir=eval_output_dir, dirt_num=args.dirt_num)
         else:
-            print(f"Could not find model at {os.path.join(LOG_DIR, args.model_path)}")
+            print(f"Could not find model at {model_load_path}")

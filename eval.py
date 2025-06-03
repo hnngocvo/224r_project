@@ -112,6 +112,10 @@ class MetricWrapper(gym.Wrapper):
         obs, reward, terminated, truncated, info = self.env.step(action)
 
         if terminated or truncated:
+            # Get the path_map from the base environment
+            path_map = self.base_env.path_map
+            info["path_map"] = path_map  # Add path_map to info
+            
             # Compute metrics
             metrics = self.base_env.compute_metrics()
             self.metrics["coverage_ratio"] = metrics["coverage_rate"]
