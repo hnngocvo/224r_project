@@ -135,24 +135,31 @@ class MetricWrapper(gym.Wrapper):
         return self.env.reset(**kwargs)
 
     def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
+        obs, reward, terminated, truncated, info_from_lower_env = self.env.step(action)
 
         if terminated or truncated:
-            # Get the path_map from the base environment
-            path_map = self.base_env.path_map
-            info["path_map"] = path_map  # Add path_map to info
-            
-            # ---- DEBUG PRINT ----
-            print(f"[MetricWrapper DEBUG] id(self.base_env): {id(self.base_env)}, path_map sum: {np.sum(path_map)}, path_map max: {np.max(path_map)}, path_map shape: {path_map.shape}")
-            # ---- END DEBUG PRINT ----
+            path_map_from_info = info_from_lower_env.get("path_map")
+            path_map_from_direct_access = self.base_env.path_map
 
-            # Compute metrics
+            print(f"[MetricWrapper DEBUG] id(self.base_env): {id(self.base_env)}")
+            if path_map_from_info is not None:
+                print(f"  path_map from info_from_lower_env: sum: {np.sum(path_map_from_info)}, max: {np.max(path_map_from_info)}, shape: {path_map_from_info.shape}")
+            else:
+                print("  path_map NOT FOUND in info_from_lower_env.")
+            print(f"  path_map from direct_access (self.base_env.path_map): sum: {np.sum(path_map_from_direct_access)}, max: {np.max(path_map_from_direct_access)}, shape: {path_map_from_direct_access.shape}")
+            
+            # The crucial part: metrics are computed using self.base_env
+            # So, the state of path_map_from_direct_access is what determines the computed metrics.
+            
+            # Update info with the path_map that will be used for metrics (direct access one)
+            info_from_lower_env["path_map"] = path_map_from_direct_access 
+            
             self.metrics['coverage_ratio'] = compute_coverage_ratio(self.base_env)
             self.metrics['path_efficiency'] = compute_redundancy_rate(self.base_env)
             self.metrics['revisit_ratio'] = compute_revisit_ratio(self.base_env)
-            info.update(self.metrics)
+            info_from_lower_env.update(self.metrics)
 
-        return obs, reward, terminated, truncated, info
+        return obs, reward, terminated, truncated, info_from_lower_env
 
     def compute_reward(self, achieved_goal, desired_goal, info):
         return self.env.compute_reward(achieved_goal, desired_goal, info)

@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
-from wrappers import ExplorationBonusWrapper, ExploitationPenaltyWrapper
+from constants import OBSTACLE, CLEAN, ROBOT, UNKNOWN, DIRTY, RETURN_TARGET
 from her import VacuumGoalWrapper, HerReplayBufferForDQN
 from eval import MetricWrapper, MetricCallback
 from gymnasium.wrappers import FlattenObservation
@@ -50,6 +50,7 @@ class VacuumEnv(gym.Env):
             "cleaned_map": spaces.Box(low=0, high=1, shape=self.grid_size, dtype=np.uint8),
             "dirt_map": spaces.Box(low=0, high=1, shape=self.grid_size, dtype=np.uint8),
             "path_map": spaces.Box(low=0, high=1, shape=self.grid_size, dtype=np.uint8),
+            "knowledge_map": spaces.Box(low=-1, high=1, shape=self.grid_size, dtype=np.float32),
         })
 
         self.orientations = {
@@ -96,8 +97,22 @@ class VacuumEnv(gym.Env):
         self.dirt_map[tuple(self.agent_pos)] = 0
 
         # store rendered path
-        self.path_map = np.zeros(self.grid_size, dtype=np.uint8)
+        self.path_map = np.zeros(self.grid_size, dtype=np.int32)
         self.path_map[tuple(self.agent_pos)] = 1  # mark the starting position
+
+        # Initialize knowledge map with semantic values
+        self.knowledge_map = np.full(self.grid_size, UNKNOWN, dtype=np.float32)
+        
+        # Set robot's starting position
+        self.knowledge_map[tuple(self.start_pos)] = ROBOT
+        
+        # Mark known dirty positions from initial dirt_map
+        dirt_positions = np.where(self.dirt_map == 1)
+        for i in range(len(dirt_positions[0])):
+            self.knowledge_map[dirt_positions[0][i], dirt_positions[1][i]] = DIRTY
+        
+        # Initialize dirt remaining counter
+        self.dirt_remaining = np.sum(self.dirt_map == 1)
 
         # counter used in internal penalty to avoid being stuck or wrappers
         self.prev_pos = list(self.agent_pos)
@@ -186,7 +201,8 @@ class VacuumEnv(gym.Env):
             "local_view": np.array([front, left, right], dtype=np.int8),     # shape: (3,)
             "cleaned_map": self.cleaned_map.astype(np.uint8),                 # shape: (H, W)
             "dirt_map": self.dirt_map.astype(np.uint8),                       # shape: (H, W)
-            "path_map": self.path_map.astype(np.uint8),                       # shape: (H, W)
+            "path_map": self.path_map.astype(np.uint8), # Cast to uint8 for obs, but keep base as int32
+            "knowledge_map": self.knowledge_map.astype(np.float32),              # shape: (H, W)
         }
 
     def _check_cell_in_direction(self, direction):
@@ -206,9 +222,14 @@ class VacuumEnv(gym.Env):
         reward = 0
         moved = False
 
+        # Track previous robot position for knowledge map updates
+        prev_robot_pos = tuple(self.agent_pos)
+
         if action == 0:  # move forward
             dx, dy = self.orientations[self.agent_orient]
             nx, ny = self.agent_pos[0] + dx, self.agent_pos[1] + dy
+            target_pos = (nx, ny)
+            
             if (
                 0 <= nx < self.grid_size[0]
                 and 0 <= ny < self.grid_size[1]
@@ -217,8 +238,21 @@ class VacuumEnv(gym.Env):
                 self.agent_pos = [nx, ny]
                 moved = True
                 reward += self.penalty_forward # forward movement cost
+                
+                # Update knowledge map for successful move
+                # Mark previous position as clean (unless it was the starting position and all dirt is cleaned)
+                if self.dirt_remaining > 0 or prev_robot_pos != tuple(self.start_pos):
+                    self.knowledge_map[prev_robot_pos] = CLEAN
+                # Mark new position as robot location
+                self.knowledge_map[tuple(self.agent_pos)] = ROBOT
+                
             else:
                 reward += self.penalty_invalid_move # invalid move (out-of-bounds or run into obstacles)
+                
+                # Update knowledge map for failed move - mark target as obstacle if in bounds
+                if 0 <= nx < self.grid_size[0] and 0 <= ny < self.grid_size[1]:
+                    self.knowledge_map[target_pos] = OBSTACLE
+                    
         elif action == 1: # rotate left
             self.agent_orient = (self.agent_orient - 1) % 8
             reward += self.penalty_rotation # rotation cost
@@ -239,6 +273,11 @@ class VacuumEnv(gym.Env):
                 reward += self.reward_clean_tile
                 self.dirt_map[x, y] = 0
                 self.cleaned_map[x, y] = 1
+                
+                # Update knowledge map for cleaned dirt
+                self.dirt_remaining -= 1
+                self.knowledge_map[x, y] = ROBOT  # Robot is now at this position
+                
             else:
                 visits = self.path_map[x, y]
                 revisit_penalty = self.penalty_revisit * visits
@@ -271,6 +310,12 @@ class VacuumEnv(gym.Env):
         at_start = self.agent_pos == self.start_pos # check if agent is at starting position
         terminated = bool(all_cleaned and at_start) # task is done only if all cleaned and at start
         truncated = False
+
+        # Update knowledge map when all dirt is cleaned - mark start position as return target
+        if all_cleaned and self.dirt_remaining == 0:
+            # Only mark return target if robot is not already at start position
+            if not at_start:
+                self.knowledge_map[tuple(self.start_pos)] = RETURN_TARGET
 
         if terminated:
             reward += self.reward_return_home # terminal bonus
@@ -378,6 +423,9 @@ class WrappedVacuumEnv:
         self.algo = algo
 
     def __call__(self):
+        # Import wrappers locally to avoid circular import
+        from wrappers import ExplorationBonusWrapper, ExploitationPenaltyWrapper
+        
         env = gym.make("VacuumEnv-v0", grid_size=self.grid_size, render_mode="plot", dirt_num=self.dirt_num)
         env = TimeLimit(env, max_episode_steps=self.max_steps)
         env = ExplorationBonusWrapper(env, bonus=0.3)

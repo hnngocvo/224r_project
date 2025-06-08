@@ -16,8 +16,9 @@ import json
 import argparse
 from torch.utils.tensorboard import SummaryWriter
 from gymnasium.wrappers import TimeLimit
-from wrappers import ExplorationBonusWrapper, ExploitationPenaltyWrapper
+from wrappers import ExplorationBonusWrapper, ExploitationPenaltyWrapper, SmartExplorationWrapper
 from datetime import datetime
+
 
 # Register custom environment
 gym.register(id="Vacuum-v0", entry_point="env:VacuumEnv")
@@ -29,61 +30,25 @@ os.makedirs(BASE_LOG_DIR, exist_ok=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Training Constants
-MAX_STEPS = 3000  # Maximum steps per episode
+MAX_STEPS = 2000  # Maximum steps per episode
 MAX_TIMESTEPS = 500000  # Maximum total timesteps for training
 
-# Hyperparameters
-GAMMA = 0.9890489964807936  # From Optuna study
-LR = 1.0161969492721541e-05  # From Optuna study
-BATCH_SIZE = 80  # From Optuna study
-BUFFER_SIZE = int(5e5)
-START_TRAINING = 1000
+# Hyperparameters - Optimized for dense reward shaping
+GAMMA = 0.99  # Standard discount factor
+LR = 3e-4  # Higher learning rate for dense rewards
+BATCH_SIZE = 32  # Smaller batches for more frequent updates
+BUFFER_SIZE = int(1e5)
+START_TRAINING = 200  # Start training earlier with dense rewards
 EPSILON_DECAY = 0.995
 MIN_EPSILON = 0.1
-UPDATE_TARGET_EVERY = 2000
-N_ATOMS = 41  # From Optuna study
-V_MIN = -19.97256170921028  # From Optuna study
-V_MAX = 19.744371778269656  # From Optuna study
-N_STEP = 5  # From Optuna study
-ALPHA = 0.6843270904544203  # PER parameters from Optuna study
-BETA = 0.560936297194832  # From Optuna study
-BETA_INCREMENT = 0.0019984316362548897  # From Optuna study
-
-# Reward normalization parameters
-REWARD_SCALING = 1.0
-REWARD_CLIP = 10.0
-
-class RunningMeanStd:
-    """Tracks running mean and standard deviation of rewards for normalization"""
-    def __init__(self, epsilon=1e-4, shape=()):
-        self.mean = np.zeros(shape, np.float64)
-        self.var = np.ones(shape, np.float64)
-        self.count = epsilon
-
-    def update(self, x):
-        batch_mean = np.mean(x, axis=0)
-        batch_var = np.var(x, axis=0)
-        batch_count = x.shape[0]
-        self.update_from_moments(batch_mean, batch_var, batch_count)
-
-    def update_from_moments(self, batch_mean, batch_var, batch_count):
-        delta = batch_mean - self.mean
-        tot_count = self.count + batch_count
-
-        new_mean = self.mean + delta * batch_count / tot_count
-        m_a = self.var * self.count
-        m_b = batch_var * batch_count
-        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
-        new_var = M2 / tot_count
-
-        self.mean = new_mean
-        self.var = new_var
-        self.count = tot_count
-
-    def normalize(self, x):
-        """Normalizes rewards using running statistics"""
-        std = np.sqrt(self.var)
-        return np.clip((x - self.mean) / (std + 1e-8), -REWARD_CLIP, REWARD_CLIP)
+UPDATE_TARGET_EVERY = 1000  # More frequent target updates
+N_ATOMS = 51  # Standard number of atoms
+V_MIN = -10  # Simpler value range for dense rewards
+V_MAX = 10  # Simpler value range for dense rewards
+N_STEP = 1  # 1-step returns for immediate learning
+ALPHA = 0.6  # Standard PER parameters
+BETA = 0.4  # Standard PER parameters
+BETA_INCREMENT = 0.001  # Standard PER parameters
 
 Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done', 'priority'))
 
@@ -93,6 +58,7 @@ class NoisyLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.std_init = std_init
+        self.noise_scale = 1.0  # Add noise scaling factor
 
         self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
         self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
@@ -122,11 +88,18 @@ class NoisyLinear(nn.Module):
         x = torch.randn(size, device=self.weight_mu.device)  # Ensure noise is on same device
         return x.sign().mul_(x.abs().sqrt_())
 
+    def set_noise_scale(self, scale):
+        """Set the noise scaling factor (0.0 = no noise, 1.0 = full noise)"""
+        self.noise_scale = scale
+
     def forward(self, x):
         if self.training:  # During training, use noise for exploration
+            # Apply noise scaling for gradual annealing
+            scaled_weight_noise = self.noise_scale * self.weight_sigma * self.weight_epsilon
+            scaled_bias_noise = self.noise_scale * self.bias_sigma * self.bias_epsilon
             return F.linear(x, 
-                self.weight_mu + self.weight_sigma * self.weight_epsilon,
-                self.bias_mu + self.bias_sigma * self.bias_epsilon)
+                self.weight_mu + scaled_weight_noise,
+                self.bias_mu + scaled_bias_noise)
         else:  # During evaluation, use mean values for deterministic behavior
             return F.linear(x, self.weight_mu, self.bias_mu)
 
@@ -138,24 +111,22 @@ class RainbowDQN(nn.Module):
         self.support = torch.linspace(V_MIN, V_MAX, N_ATOMS).to(device)
         self.delta_z = (V_MAX - V_MIN) / (N_ATOMS - 1)
 
-        # Process different observation components
-        self.agent_pos_net = nn.Sequential(
-            nn.Linear(2, 64),
-            nn.ReLU()
-        )
+        # Process observation components
+        # Use embedding for discrete orientation (8 directions -> 8 features)
+        self.agent_orient_embedding = nn.Embedding(8, 8)
+
+        # Knowledge map processing network (flatten 2D map to 1D)
+        map_size = obs_dim.get('knowledge_map', 36)  # Default to 6x6=36 if not specified
         
-        self.agent_orient_net = nn.Sequential(
-            nn.Linear(1, 32),
-            nn.ReLU()
-        )
-        
-        self.local_view_net = nn.Sequential(
-            nn.Linear(3, 32),
+        self.knowledge_map_net = nn.Sequential(
+            nn.Linear(map_size, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
             nn.ReLU()
         )
 
-        # Combine all features
-        combined_size = 64 + 32 + 32
+        # Combine all features: 8 + 64 = 72
+        combined_size = 8 + 64
 
         # Advantage and Value streams with NoisyLinear
         self.advantage_hidden = NoisyLinear(combined_size, 128)
@@ -165,33 +136,22 @@ class RainbowDQN(nn.Module):
         self.value = NoisyLinear(128, N_ATOMS)
 
     def forward(self, x: Dict[str, torch.Tensor]) -> torch.Tensor:
-        batch_size = x['agent_pos'].shape[0]
+        batch_size = x['agent_orient'].shape[0]
         
-        # Process each input component
-        pos_features = self.agent_pos_net(x['agent_pos'].float())  # [batch_size, 64]
+        # Process agent orientation for embedding - ensure it's integer and right shape
+        orient = x['agent_orient']
+        if orient.dim() == 2 and orient.shape[1] == 1:
+            orient = orient.squeeze(-1)  # [batch_size, 1] -> [batch_size]
+        orient_features = self.agent_orient_embedding(orient.long())  # [batch_size, 8]
         
-        # Handle orientation - ensure it's 2D
-        orient = x['agent_orient'].float()
-        if orient.dim() == 1:
-            orient = orient.unsqueeze(-1)  # Add feature dimension
-        elif orient.dim() == 3:
-            orient = orient.squeeze(1)  # Remove extra dimension if present
-        orient_features = self.agent_orient_net(orient)  # [batch_size, 32]
+        # Process knowledge map (flatten 2D to 1D)
+        knowledge_map = x['knowledge_map'].float().flatten(start_dim=1)  # [batch_size, H*W]
+        knowledge_features = self.knowledge_map_net(knowledge_map)  # [batch_size, 64]
         
-        # Handle local view
-        view = x['local_view'].float()
-        if view.dim() == 3:
-            view = view.squeeze(1)  # Remove extra dimension if present
-        view_features = self.local_view_net(view)  # [batch_size, 32]
-        
-        # Ensure all features have the same number of dimensions
-        if pos_features.dim() != orient_features.dim():
-            pos_features = pos_features.unsqueeze(1) if pos_features.dim() < orient_features.dim() else pos_features
-            orient_features = orient_features.unsqueeze(1) if orient_features.dim() < pos_features.dim() else orient_features
-            view_features = view_features.unsqueeze(1) if view_features.dim() < pos_features.dim() else view_features
-        
-        # Combine features
-        combined = torch.cat([pos_features, orient_features, view_features], dim=1)
+        # Combine all features
+        combined = torch.cat([
+            orient_features, knowledge_features
+        ], dim=1)  # [batch_size, 72]
         
         # Dueling architecture with noisy layers
         advantage_hidden = F.relu(self.advantage_hidden(combined))
@@ -212,21 +172,46 @@ class RainbowDQN(nn.Module):
         self.value_hidden.reset_noise()
         self.value.reset_noise()
 
-    def act(self, state: Dict[str, np.ndarray], epsilon: float = 0.0) -> int:
+    def set_noise_scale(self, scale):
+        """Set noise scaling factor for all noisy layers"""
+        self.advantage_hidden.set_noise_scale(scale)
+        self.advantage.set_noise_scale(scale)
+        self.value_hidden.set_noise_scale(scale)
+        self.value.set_noise_scale(scale)
+
+    def act(self, state: Dict[str, np.ndarray], epsilon: float = 0.0, temperature: float = 1.0) -> int:
         if random.random() < epsilon:
             return random.randint(0, self.n_actions - 1)
         
         with torch.no_grad():
             # Convert numpy arrays to tensors and add batch dimension
             state = {
-                'agent_pos': torch.FloatTensor(state['agent_pos']).unsqueeze(0).to(device),
-                'agent_orient': torch.FloatTensor([state['agent_orient']]).to(device),
-                'local_view': torch.FloatTensor(state['local_view']).unsqueeze(0).to(device)
+                'agent_orient': torch.FloatTensor(state['agent_orient']).to(device),
+                'knowledge_map': torch.FloatTensor(state['knowledge_map']).unsqueeze(0).to(device)
             }
             
             dist = self(state)
             q_values = (dist * self.support).sum(dim=2)
-            return q_values.argmax(1).item()
+            
+            if self.training:
+                # During training: use deterministic argmax (noise provides exploration)
+                action = q_values.argmax(1).item()
+            else:
+                # During evaluation: sample from Q-value distribution
+                # Apply temperature scaling for controllable randomness
+                q_scaled = q_values[0] / temperature
+                action_probs = F.softmax(q_scaled, dim=0)
+                action = torch.multinomial(action_probs, 1).item()
+            
+            # Log Q-values for debugging (only during evaluation)
+            # if not self.training:
+            #     q_vals = q_values[0].cpu().numpy()
+            #     action_names = ["forward", "left", "right"]
+            #     action_probs_np = action_probs.cpu().numpy()
+            #     print(f"Q-values: [Forward: {q_vals[0]:.3f}, Left: {q_vals[1]:.3f}, Right: {q_vals[2]:.3f}]")
+            #     print(f"Action probs: [Forward: {action_probs_np[0]:.3f}, Left: {action_probs_np[1]:.3f}, Right: {action_probs_np[2]:.3f}] -> Action: {action_names[action]}")
+            
+            return action
 
 class PrioritizedReplayBuffer:
     def __init__(self, capacity: int):
@@ -316,16 +301,14 @@ class PrioritizedReplayBuffer:
 
         # Convert dictionary observations to tensors with consistent shapes
         states = {
-            'agent_pos': torch.FloatTensor(np.vstack([s.state['agent_pos'] for s in samples])).to(device),  # [batch_size, 2]
-            'agent_orient': torch.FloatTensor([s.state['agent_orient'] for s in samples]).reshape(-1).to(device),  # [batch_size]
-            'local_view': torch.FloatTensor(np.vstack([s.state['local_view'] for s in samples])).to(device)  # [batch_size, 3]
+            'agent_orient': torch.FloatTensor(np.array([s.state['agent_orient'] for s in samples])).to(device),  # [batch_size, 1]
+            'knowledge_map': torch.FloatTensor(np.stack([s.state['knowledge_map'] for s in samples])).to(device)  # [batch_size, H, W]
         }
         actions = torch.LongTensor([s.action for s in samples]).to(device)
         rewards = torch.FloatTensor([s.reward for s in samples]).to(device)
         next_states = {
-            'agent_pos': torch.FloatTensor(np.vstack([s.next_state['agent_pos'] for s in samples])).to(device),  # [batch_size, 2]
-            'agent_orient': torch.FloatTensor([s.next_state['agent_orient'] for s in samples]).reshape(-1).to(device),  # [batch_size]
-            'local_view': torch.FloatTensor(np.vstack([s.next_state['local_view'] for s in samples])).to(device)  # [batch_size, 3]
+            'agent_orient': torch.FloatTensor(np.array([s.next_state['agent_orient'] for s in samples])).to(device),  # [batch_size, 1]
+            'knowledge_map': torch.FloatTensor(np.stack([s.next_state['knowledge_map'] for s in samples])).to(device)  # [batch_size, H, W]
         }
         dones = torch.FloatTensor([s.done for s in samples]).to(device)
 
@@ -396,19 +379,24 @@ def project_distribution(next_dist, rewards, dones, support, delta_z, gamma):
             
     return proj_dist
 
-def rollout_and_record(env, policy_net, filename="rainbow_run.mp4", max_steps=MAX_STEPS, walls=None):
-    """Record a video of the agent's performance"""
+def rollout_and_record(env, policy_net, filename="rainbow_run.mp4", max_steps=MAX_STEPS, walls=None, temperature=1.0):
+    """
+    Record a video of the agent's performance in a NEW episode.
+    
+    WARNING: This creates a NEW episode with env.reset() - use only for standalone recording!
+    For evaluation videos, the evaluate() function now records during the actual episode.
+    """
     print(f"\nRecording video for {max_steps} steps...")
     obs, _ = env.reset(options={"walls": walls})
     frames = []
 
     for step in range(max_steps):
         # Render and save frame
-        fig = env.render_frame()
+        fig = env.unwrapped.render_frame()
         frames.append(fig)
 
-        # Get action from policy
-        action = policy_net.act(obs, epsilon=0.0)  # No exploration during recording
+        # Get action from policy using sampling
+        action = policy_net.act(obs, epsilon=0.0, temperature=temperature)
         obs, _, terminated, truncated, _ = env.step(action)
 
         if terminated or truncated:
@@ -488,11 +476,9 @@ def print_metrics(metrics, prefix=""):
         else:
             print(f"{prefix}{key:20}: {value}")
 
-def print_progress_bar(iteration, total, prefix='', suffix='', decimals=1, length=50, fill='█'):
+def print_progress_bar(iteration, total, prefix='', suffix='', decimals=1, length=50, fill='#'):
     percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
-    filled_length = int(length * iteration // total)
-    bar = fill * filled_length + '-' * (length - filled_length)
-    print(f'\r{prefix} |{bar}| {percent}% {suffix}', end='\r')
+    print(f' {prefix} {percent}% {suffix}', end=' ')
     if iteration == total:
         print()
 
@@ -572,24 +558,19 @@ def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps:
     writer = SummaryWriter(os.path.join(output_dir, 'tensorboard'))
     print(f"TensorBoard logs will be saved to: {os.path.join(output_dir, 'tensorboard')}")
     
-    # Initialize reward normalizer
-    reward_normalizer = RunningMeanStd(shape=())
-    
     # Create environment if not provided
     if env is None:
         # Create and wrap environment with metrics and additional wrappers
-        env = gym.make(env_id, grid_size=grid_size, use_counter=False, dirt_num=dirt_num)  # Add grid_size parameter
+        env = gym.make(env_id, grid_size=grid_size, use_counter=False, dirt_num=dirt_num)
         env = TimeLimit(env, max_episode_steps=MAX_STEPS)
-        env = ExplorationBonusWrapper(env, bonus=0.10525612628712341)  # From Optuna study
-        env = ExploitationPenaltyWrapper(env, time_penalty=-0.0020989802390739463, stay_penalty=-0.05073560696895504)  # From Optuna study
+        env = SmartExplorationWrapper(env)  # Intelligent reward shaping
+        # env = ExploitationPenaltyWrapper(env, time_penalty=-0.0020989802390739463, stay_penalty=-0.05073560696895504)  # From Optuna study
         env = MetricWrapper(env)
     
     print("\nEnvironment Wrappers:")
     print(f"- TimeLimit: {MAX_STEPS} steps")
-    print(f"- ExplorationBonus: +{0.10525612628712341}")  # From Optuna study
-    print(f"- ExploitationPenalty: time={-0.0020989802390739463}, stay={-0.05073560696895504}")  # From Optuna study
+    print("- SmartExploration: Intelligent reward shaping enabled")
     print("- MetricWrapper: enabled")
-    print("- Internal stuck counter: disabled")
     
     # Initialize metrics dictionary
     training_metrics = {
@@ -604,14 +585,15 @@ def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps:
     
     print_section_header("Network Architecture")
     obs_dim = {
-        'agent_pos': env.observation_space['agent_pos'].shape[0],
         'agent_orient': 1,
-        'local_view': env.observation_space['local_view'].shape[0]
+        'knowledge_map': grid_size[0] * grid_size[1] # Flattened 2D map size
     }
     n_actions = env.action_space.n
     print(f"Observation dimensions: {obs_dim}")
     print(f"Number of actions: {n_actions}")
     print(f"Number of atoms: {N_ATOMS}")
+    print(f"Knowledge map: {grid_size[0]}x{grid_size[1]} = {grid_size[0] * grid_size[1]} values")
+    print("Network includes: agent_orient, knowledge_map")
 
     # Initialize networks and optimizer
     policy_net = RainbowDQN(obs_dim, n_actions).to(device)
@@ -644,38 +626,54 @@ def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps:
     print(f"Gamma: {GAMMA}")
     print(f"Start training at: {START_TRAINING} steps")
     print(f"Target network update frequency: {UPDATE_TARGET_EVERY}")
+    print(f"Noise annealing: 1.0 -> 0.1 over {total_timesteps} steps")
+    print("*** OPTIMIZED FOR DENSE REWARD SHAPING ***")
     print("\nStarting training loop...")
 
     obs, _ = env.reset(options={"walls": walls})
     episode_reward = 0
+    episode_base_reward = 0  # Track base rewards separately
+    episode_exploration_reward = 0  # Track exploration rewards separately
     episode_count = 0
     episode_steps = 0
     total_loss = 0
     num_updates = 0
     beta = BETA
-
+    noise_scale = 1.0  # Initialize noise scale
     best_reward = float('-inf')
+    action_counts = [0, 0, 0]  # Track action distribution [forward, left, right]
 
     for step in range(total_timesteps):
         if step % 100 == 0:
             print_progress_bar(step, total_timesteps, prefix='Progress:', suffix='Complete', length=40)
             
         episode_steps += 1
+        
+        # Implement noise annealing: start at 1.0, end at 0.1
+        noise_scale = max(0.1, 1.0 - 0.9 * (step / total_timesteps))
+        policy_net.set_noise_scale(noise_scale)
         policy_net.reset_noise()
         
         action = policy_net.act(obs)
+        action_counts[action] += 1  # Track action distribution
         next_obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
         
-        # Normalize reward
-        reward_normalizer.update(np.array([reward]))
-        normalized_reward = float(reward_normalizer.normalize(np.array([reward]))[0])
-        normalized_reward *= REWARD_SCALING
+        # Track reward components if available
+        base_reward = info.get('base_reward', reward)  # Fallback to total reward if not available
+        exploration_reward = info.get('exploration_reward', 0.0)
         
-        buffer.push(obs, action, normalized_reward, next_obs, done)
+        # Debug reward breakdown for first 5 steps of first 2 episodes
+        if episode_count < 2 and episode_steps <= 5:
+            action_names = ["Forward", "Left", "Right"]
+            print(f"Step {episode_steps}: {action_names[action]} | Base: {base_reward:.3f}, Exploration: {exploration_reward:.3f}, Total: {reward:.3f}")
+        
+        buffer.push(obs, action, reward, next_obs, done)
         
         obs = next_obs
-        episode_reward += reward  # Track original reward for logging
+        episode_reward += reward  # Track total reward for logging
+        episode_base_reward += base_reward  # Track base reward separately
+        episode_exploration_reward += exploration_reward  # Track exploration reward separately
 
         if done:
             episode_count += 1
@@ -683,8 +681,11 @@ def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps:
             
             # Log metrics to TensorBoard
             writer.add_scalar('Train/Episode_Reward', episode_reward, episode_count)
+            writer.add_scalar('Train/Episode_Base_Reward', episode_base_reward, episode_count)
+            writer.add_scalar('Train/Episode_Exploration_Reward', episode_exploration_reward, episode_count)
             writer.add_scalar('Train/Episode_Length', episode_steps, episode_count)
             writer.add_scalar('Train/Average_Loss', avg_loss, episode_count)
+            writer.add_scalar('Train/Noise_Scale', noise_scale, episode_count)
             
             if "coverage_ratio" in info:
                 writer.add_scalar('Train/Coverage_Ratio', info["coverage_ratio"], episode_count)
@@ -708,7 +709,14 @@ def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps:
             print_section_header(f"Episode {episode_count} Complete")
             print(f"Steps: {episode_steps}")
             print(f"Total Reward: {episode_reward:.2f}")
+            print(f"  Base Reward: {episode_base_reward:.2f}")
+            print(f"  Exploration Reward: {episode_exploration_reward:.2f}")
             print(f"Average Loss: {avg_loss:.4f}")
+            print(f"Noise Scale: {noise_scale:.3f}")
+            total_actions = sum(action_counts)
+            if total_actions > 0:
+                action_dist = [count/total_actions for count in action_counts]
+                print(f"Action Distribution - Forward: {action_dist[0]:.2%}, Left: {action_dist[1]:.2%}, Right: {action_dist[2]:.2%}")
             if "coverage_ratio" in info:
                 print("\nCleaning Metrics:")
                 print(f"Coverage: {info['coverage_ratio']:.2%}")
@@ -717,9 +725,12 @@ def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps:
             
             obs, _ = env.reset(options={"walls": walls})
             episode_reward = 0
+            episode_base_reward = 0
+            episode_exploration_reward = 0
             episode_steps = 0
             total_loss = 0
             num_updates = 0
+            action_counts = [0, 0, 0]  # Reset action distribution
 
         # Training
         if len(buffer) >= START_TRAINING:
@@ -798,7 +809,7 @@ def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps:
     env.close()
     return policy_net
 
-def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=5, render=True, walls=None, env=None, output_dir: str = None, dirt_num: int = 5):
+def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=1, render=True, walls=None, env=None, output_dir: str = None, dirt_num: int = 5, temperature: float = 1.0):
     if output_dir is None:
         # Fallback if no output_dir is provided, though __main__ should provide it.
         output_dir = get_log_dir(grid_size)
@@ -813,19 +824,25 @@ def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=5, rende
     print(f"Rendering: {'enabled' if render else 'disabled'}")
     print(f"Device: {next(policy_net.parameters()).device}")
     print(f"Training mode before eval(): {policy_net.training}")
+    print(f"Action selection: Sampling from Q-value distribution (temperature={temperature})")
     
     # Create environment if not provided
     if env is None:
         # Create and wrap environment with same wrappers as training
         env = gym.make(env_id, grid_size=grid_size, render_mode="plot", use_counter=False, dirt_num=dirt_num)
         env = TimeLimit(env, max_episode_steps=MAX_STEPS)
-        env = ExplorationBonusWrapper(env, bonus=0.10525612628712341)  # From Optuna study
+        env = SmartExplorationWrapper(env)  # Intelligent reward shaping
         env = ExploitationPenaltyWrapper(env, time_penalty=-0.0020989802390739463, stay_penalty=-0.05073560696895504)  # From Optuna study
         env = MetricWrapper(env)
     
     print("\nEnvironment Wrappers:")
     print(f"- TimeLimit: {MAX_STEPS} steps")
-    print(f"- ExplorationBonus: +{0.10525612628712341}")  # From Optuna study
+    print("- SmartExploration: Intelligent reward shaping enabled")
+    print("  * New cell bonus: +0.2")
+    print("  * Wall turn bonus: +0.5") 
+    print("  * Home progress bonus: +0.1")
+    print("  * Spinning penalty: -0.5")
+    print("  * Flip-flop penalty: -0.2")
     print(f"- ExploitationPenalty: time={-0.0020989802390739463}, stay={-0.05073560696895504}")  # From Optuna study
     print("- MetricWrapper: enabled")
     print("- Internal stuck counter: disabled")
@@ -850,13 +867,24 @@ def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=5, rende
         done = False
         total_reward = 0
         steps = 0
+        eval_action_counts = [0, 0, 0]  # Track actions in this episode
+        
+        # Initialize video recording for this episode
+        frames = [] if render else None
 
         while not done:
+            # Record frame before taking action (if rendering)
+            if render:
+                fig = env.unwrapped.render_frame()
+                frames.append(fig)
+            
             # Use deterministic actions during evaluation (no noise, no epsilon)
             with torch.no_grad():  # Ensure no gradients during evaluation
-                action = policy_net.act(obs, epsilon=0.0)
+                action = policy_net.act(obs, epsilon=0.0, temperature=temperature)
+                eval_action_counts[action] += 1
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
+            
             total_reward += reward
             steps += 1
 
@@ -871,21 +899,37 @@ def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=5, rende
         print("\nEpisode Results:")
         print(f"Steps: {steps}")
         print(f"Total Reward: {total_reward:.2f}")
+        total_eval_actions = sum(eval_action_counts)
+        if total_eval_actions > 0:
+            eval_action_dist = [count/total_eval_actions for count in eval_action_counts]
+            print(f"Action Distribution - Forward: {eval_action_dist[0]:.2%}, Left: {eval_action_dist[1]:.2%}, Right: {eval_action_dist[2]:.2%}")
         print("\nCleaning Metrics:")
         print(f"Coverage: {info.get('coverage_ratio', 0):.2%}")
         print(f"Path Efficiency: {info.get('path_efficiency', 0):.2f}")
         print(f"Revisit Ratio: {info.get('revisit_ratio', 0):.2f}")
         
-        if render:
-            # ---- DEBUG PRINT ----
-            if hasattr(env, 'unwrapped'):
-                print(f"[evaluate DEBUG] id(env.unwrapped) before rollout_and_record: {id(env.unwrapped)}")
-            else:
-                print(f"[evaluate DEBUG] env has no unwrapped attribute before rollout_and_record")
-            # ---- END DEBUG PRINT ----
+        # Save video from the actual episode frames
+        if render and frames:
             video_path = os.path.join(output_dir, f"eval_ep_{episodes - ep}.mp4")
-            rollout_and_record(env.unwrapped, policy_net, filename=video_path, walls=walls)
-            print(f"\nSaved video: {video_path}")
+            print(f"\nSaving video from {len(frames)} frames of the actual evaluation episode...")
+            
+            # Create animation from recorded frames
+            fig, ax = plt.subplots()
+            im = ax.imshow(frames[0])
+            ax.axis("off")
+
+            def update(i):
+                im.set_array(frames[i])
+                return [im]
+
+            ani = animation.FuncAnimation(
+                fig, update, frames=len(frames), interval=100, blit=True
+            )
+
+            # Save animation
+            ani.save(video_path, writer="ffmpeg")
+            plt.close(fig)
+            print(f"Video saved to: {video_path}")
 
     # Calculate and print summary statistics
     print_section_header("Evaluation Summary")
@@ -919,62 +963,42 @@ if __name__ == "__main__":
     parser.add_argument('--timesteps', type=int, default=MAX_TIMESTEPS,
                       help='Number of timesteps to train for')
     parser.add_argument('--eval_episodes', type=int, default=5,
-                      help='Number of episodes to evaluate for')
+                      help='Number of episodes to evaluate for, at most')
     parser.add_argument('--grid_size', type=int, nargs=2, default=[6, 6],
                       help='Grid size as two integers (e.g., 6 6 for 6x6 grid)')
-    parser.add_argument('--wall_mode', choices=['random', 'hardcoded'], default='random',
-                      help='Wall layout: "random" or "hardcoded" (only applies to 40x30 grid)')
+    parser.add_argument('--wall_mode', choices=['none', 'random', 'hardcoded'], default='none',
+                      help='Wall layout: "none" (no walls), "random" (generate random rooms), or "hardcoded" (only applies to 40x30 grid)')
     parser.add_argument('--seed', type=int, default=None,
                       help='Random seed for reproducibility')
     parser.add_argument('--dirt_num', type=int, default=5,
                       help='Number of dirt clusters to generate (0 means all non-obstacle tiles are dirt)')
+    parser.add_argument('--temperature', type=float, default=1.0,
+                      help='Temperature for action sampling during evaluation (1.0=normal, >1.0=more random, <1.0=more deterministic)')
     args = parser.parse_args()
 
     grid_size = tuple(args.grid_size)
-    # LOG_DIR = get_log_dir(grid_size) # Removed: LOG_DIR will be determined per mode
 
-    # Import hardcoded wall layout if needed
+    # Set up wall configuration based on mode
     walls = None
     if args.wall_mode == 'hardcoded' and grid_size == (40, 30):
         from run import generate_1b1b_layout_grid
         walls = generate_1b1b_layout_grid()
+    elif args.wall_mode == 'random':
+        # Pass empty string to trigger random room generation in env.reset()
+        # This will cause the else branch in env.py reset() to execute generate_random_rooms()
+        walls = ""
+    elif args.wall_mode == 'none':
+        # Keep walls = None to skip wall generation entirely
+        walls = None
 
-    if args.mode == 'train':
-        # Determine log directory for this run
-        run_log_dir = get_log_dir(grid_size)
-        print(f"All outputs for this run will be saved to: {run_log_dir}")
+    # Determine log directory for this run
+    run_log_dir = get_log_dir(grid_size)
+    print(f"All outputs for this run will be saved to: {run_log_dir}")
 
-        # Train a new model
-        model = train(total_timesteps=args.timesteps, grid_size=grid_size, walls=walls, 
-                     seed=args.seed, output_dir=run_log_dir, dirt_num=args.dirt_num)
-        # Evaluate the trained model, saving results in the same directory
-        evaluate(model, grid_size=grid_size, episodes=args.eval_episodes, walls=walls, output_dir=run_log_dir, dirt_num=args.dirt_num)
-    else: # args.mode == 'eval'
-        # args.model_path is expected to be a path to the model file.
-        # The directory of this file will be used for saving evaluation outputs.
-        model_load_path = os.path.abspath(args.model_path)
-        eval_output_dir = os.path.dirname(model_load_path)
-        os.makedirs(eval_output_dir, exist_ok=True) # Ensure the directory exists
+    # Train a new model
+    model = train(total_timesteps=args.timesteps, grid_size=grid_size, walls=walls, 
+                    seed=args.seed, output_dir=run_log_dir, dirt_num=args.dirt_num)
+    # Evaluate the trained model
+    evaluate(model, grid_size=grid_size, episodes=args.eval_episodes, walls=walls, 
+            output_dir=run_log_dir, dirt_num=args.dirt_num, temperature=args.temperature)
 
-        print(f"Loading model from: {model_load_path}")
-        print(f"Evaluation outputs will be saved to: {eval_output_dir}")
-
-        # Create a new model instance
-        env = gym.make("Vacuum-v0", grid_size=grid_size)
-        obs_dim = {
-            'agent_pos': env.observation_space['agent_pos'].shape[0],
-            'agent_orient': 1,
-            'local_view': env.observation_space['local_view'].shape[0]
-        }
-        n_actions = env.action_space.n
-        model = RainbowDQN(obs_dim, n_actions).to(device)
-        env.close()
-
-        # Load and evaluate the model
-        loaded_model = load_model(model, model_load_path) # Pass full path
-        if loaded_model is not None:
-            # Ensure model is in evaluation mode
-            loaded_model.eval()
-            evaluate(loaded_model, grid_size=grid_size, episodes=args.eval_episodes, walls=walls, output_dir=eval_output_dir, dirt_num=args.dirt_num)
-        else:
-            print(f"Could not find model at {model_load_path}")
