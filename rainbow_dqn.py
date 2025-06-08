@@ -828,7 +828,7 @@ def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=1, rende
     # Create environment if not provided
     if env is None:
         # Create and wrap environment with same wrappers as training
-        env = gym.make(env_id, grid_size=grid_size, render_mode="plot", dirt_num=dirt_num)
+        env = gym.make(env_id, grid_size=grid_size, dirt_num=dirt_num)
         env = TimeLimit(env, max_episode_steps=MAX_STEPS)
         env = SmartExplorationWrapper(env)  # Intelligent reward shaping
         # env = ExploitationPenaltyWrapper(env, time_penalty=-0.0020989802390739463, stay_penalty=-0.05073560696895504)  # From Optuna study

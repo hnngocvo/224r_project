@@ -285,6 +285,9 @@ class VacuumEnv(gym.Env):
             if 0 <= x < self.grid_size[0] and 0 <= y < self.grid_size[1]:
                 if self.obstacle_map[x, y] == 1:
                     self.known_obstacle_map[x, y] = 1
+                    self.knowledge_map[x, y] = OBSTACLE
+                elif self.knowledge_map[x, y] == UNKNOWN:
+                    self.knowledge_map[x, y] = CLEAN
 
     def step(self, action):
         """Take a step in the environment"""
