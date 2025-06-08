@@ -8,7 +8,7 @@ from env import WrappedVacuumEnv, VacuumEnv
 import matplotlib.pyplot as plt
 from gymnasium.spaces.utils import flatten
 import os
-from eval import compute_coverage_ratio
+
 
 register(
     id="VacuumEnv-v0",
@@ -54,7 +54,7 @@ def rollout_and_save_last_frame(env, model, filename="last_frame.png", max_steps
 
         if terminated or truncated:
             break
-    print(compute_coverage_ratio(env.unwrapped))
+    print(env.unwrapped.compute_metrics()["coverage_rate"])
 
     os.makedirs(os.path.dirname(dir_name), exist_ok=True)
     plt.figure()
