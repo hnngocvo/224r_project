@@ -344,7 +344,7 @@ class VacuumEnv(gym.Env):
             # Update knowledge map for cleaned dirt
             self.dirt_remaining -= 1
             self.knowledge_map[x, y] = ROBOT  # Robot is now at this position
-        self.cleaned_map[x, y] = 1
+            self.cleaned_map[x, y] = 1
         self.dirt_map[x, y] = 0
         self.path_map[x, y] += 1
         if self.path_map[x, y] >= 127:
