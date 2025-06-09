@@ -427,206 +427,82 @@ class PPOExplorationWrapper(gym.Wrapper):
         return self.env.unwrapped.known_obstacle_map[tx, ty] == 1
 
 
-class SmartExplorationWrapper(gym.Wrapper):
+class DumbWrapper(gym.Wrapper):
     """
-    Advanced exploration wrapper with dense rewards for efficient cleaning.
-    
-    Features:
-    1. History rewards: Penalize revisiting recent position+orientation combinations
-    2. Distance rewards: BFS-based rewards for moving toward objectives  
-    3. Tweaked base rewards: Counteract harsh base penalties
-    4. Rotation rewards: Encourage smart turning behavior
+    Minimal exploration wrapper that adds only essential rewards:
+    1. New tile bonus - encourages exploration
+    2. Obstacle discovery bonus - rewards finding walls
+    3. Escalating stuck prevention - prevents infinite loops
     """
     
-    def __init__(self, env):
+    def __init__(self, env, new_tile_bonus=0.15, obstacle_discovery_bonus=0.05, stuck_penalty=-0.1):
         super().__init__(env)
         self.grid_size = self.env.unwrapped.grid_size
-        self.orientations = self.env.unwrapped.orientations
+        self.new_tile_bonus = new_tile_bonus  # larger than forward cost (0.05)
+        self.obstacle_discovery_bonus = obstacle_discovery_bonus
+        self.stuck_penalty = stuck_penalty
         
-        # History tracking (past 10 moves)
-        self.action_history = deque(maxlen=10)
-        self.position_orientation_history = deque(maxlen=10)
-        
-        # Previous state for reward calculation
-        self.prev_pos = None
-        self.prev_orient = None
-        self.prev_knowledge_map = None
-        
-        # Reward tracking for debugging
-        self.last_base_reward = 0.0
-        self.last_exploration_reward = 0.0
+        # Simple tracking
+        self.visit_map = np.zeros(self.grid_size, dtype=np.int32)
+        self.known_obstacles = np.zeros(self.grid_size, dtype=np.uint8)
+        self.last_pos = None
+        self.stuck_counter = 0
         
     def reset(self, **kwargs):
-        self.action_history.clear()
-        self.position_orientation_history.clear()
-        self.prev_pos = None
-        self.prev_orient = None
-        self.prev_knowledge_map = None
-        self.last_base_reward = 0.0
-        self.last_exploration_reward = 0.0
+        self.visit_map.fill(0)
+        self.known_obstacles.fill(0)
+        self.last_pos = None
+        self.stuck_counter = 0
         
         obs, info = self.env.reset(**kwargs)
         
-        # Initialize tracking
-        self.prev_pos = tuple(self.env.unwrapped.agent_pos)
-        self.prev_orient = self.env.unwrapped.agent_orient
-        self.prev_knowledge_map = obs['knowledge_map'].copy()
+        # Mark starting position as visited
+        pos = tuple(self.env.unwrapped.agent_pos)
+        self.visit_map[pos] = 1
+        self.last_pos = pos
         
         return obs, info
     
     def step(self, action):
-        # Store state before action
-        old_pos = tuple(self.env.unwrapped.agent_pos)
-        old_orient = self.env.unwrapped.agent_orient
-        
-        # Take the action
         obs, base_reward, terminated, truncated, info = self.env.step(action)
         
-        # Get new state
-        new_pos = tuple(self.env.unwrapped.agent_pos)
-        new_orient = self.env.unwrapped.agent_orient
-        knowledge_map = obs['knowledge_map']
+        pos = tuple(self.env.unwrapped.agent_pos)
+        exploration_reward = 0.0
         
-        # Calculate exploration reward
-        exploration_reward = self._calculate_exploration_reward(
-            action, old_pos, old_orient, new_pos, new_orient, knowledge_map, base_reward
-        )
+        # 1. New tile bonus - simple exploration incentive
+        if self.visit_map[pos] == 0:
+            exploration_reward += self.new_tile_bonus
+        self.visit_map[pos] += 1
         
-        # Store for debugging
-        self.last_base_reward = base_reward
-        self.last_exploration_reward = exploration_reward
+        # 2. Obstacle discovery bonus - reward finding new obstacles
+        newly_discovered = 0
+        known_map = self.env.unwrapped.known_obstacle_map
+        for i in range(self.grid_size[0]):
+            for j in range(self.grid_size[1]):
+                if known_map[i, j] == 1 and self.known_obstacles[i, j] == 0:
+                    self.known_obstacles[i, j] = 1
+                    newly_discovered += 1
+        
+        if newly_discovered > 0:
+            exploration_reward += self.obstacle_discovery_bonus * newly_discovered
+        
+        # 3. Escalating stuck prevention - penalize staying in same spot
+        if pos == self.last_pos:
+            self.stuck_counter += 1
+            if self.stuck_counter >= 5:
+                # Escalate: -0.1, -0.2, -0.3, -0.4, etc.
+                exploration_reward += self.stuck_penalty * (self.stuck_counter - 3)
+        else:
+            self.stuck_counter = 0
+        
+        self.last_pos = pos
         
         # Add reward breakdown to info for debugging
         info['base_reward'] = base_reward
         info['exploration_reward'] = exploration_reward
         info['total_reward'] = base_reward + exploration_reward
         
-        # Update history
-        self.action_history.append(action)
-        self.position_orientation_history.append((old_pos, old_orient))
-        
-        # Update tracking variables
-        self.prev_pos = new_pos
-        self.prev_orient = new_orient
-        self.prev_knowledge_map = knowledge_map.copy()
-        
         return obs, base_reward + exploration_reward, terminated, truncated, info
-    
-    def _calculate_exploration_reward(self, action, old_pos, old_orient, new_pos, new_orient, knowledge_map, base_reward):
-        """Calculate dense exploration rewards"""
-        reward = 0.0
-        # Reward forward movement
-        if action == 0:  # Forward action
-            reward += 0.1
-
-        # 1. History rewards - penalize revisiting recent position+orientation combinations
-        reward += self._history_reward(action, old_pos, old_orient, new_pos, new_orient)
-        
-        # 2. Distance rewards - reward moves toward objectives
-        reward += self._distance_reward(old_pos, new_pos, knowledge_map)
-        
-        # 3. Tweaked base rewards - counteract harsh base penalties
-        reward += self._tweaked_base_rewards(action, old_pos, new_pos, knowledge_map, base_reward)
-        
-        # 4. Rotation rewards - encourage smart turning
-        reward += self._rotation_reward(action, old_pos, old_orient, new_orient, knowledge_map)
-        
-        return reward
-    
-    def _history_reward(self, action, old_pos, old_orient, new_pos, new_orient):
-        """Penalize moves that revisit recent position+orientation combinations"""
-        # Check if this position+orientation combination was visited recently
-        current_state = (new_pos, new_orient)
-        if current_state in self.position_orientation_history:
-            return -0.5  # Penalty for flip-flopping or spinning
-        return 0.0
-    
-    def _distance_reward(self, old_pos, new_pos, knowledge_map):
-        """Reward moves that get closer to objectives using BFS distances"""
-        if old_pos == new_pos:  # No movement (rotation only)
-            return 0.0
-            
-        # Calculate BFS distances from both positions
-        old_distances = self._bfs_distances(old_pos, knowledge_map)
-        new_distances = self._bfs_distances(new_pos, knowledge_map)
-        
-        reward = 0.0
-        
-        # Check if return target is present (all dirt cleaned)
-        return_target_pos = self._find_return_target(knowledge_map)
-        if return_target_pos is not None:
-            # Heavily reward moving toward return target
-            old_dist = old_distances.get(return_target_pos, float('inf'))
-            new_dist = new_distances.get(return_target_pos, float('inf'))
-            if new_dist < old_dist:
-                reward += 1.0  # Large reward for approaching home
-            else:
-                reward -= 1.0  # Large penalty for moving away from home
-        else:
-            self.stay_counter = 0
-        self.prev_pos = curr_pos
-
-        for threshold, penalty in zip(self.stay_thresholds, self.penalties):
-            if self.stay_counter == threshold:
-                reward += penalty
-
-        return obs, reward, terminated, truncated, info
-
-    def _update_known_mask(self):
-        x, y = self.env.unwrapped.agent_pos
-        for dx in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                nx, ny = x + dx, y + dy
-                if 0 <= nx < self.grid_size[0] and 0 <= ny < self.grid_size[1]:
-                    self.known_mask[nx, ny] = 1
-
-    def _frontier_bonus(self, pos, dirt_map):
-        x, y = pos
-        for dx in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                if dx == dy == 0:
-                    continue
-                nx, ny = x + dx, y + dy
-                if 0 <= nx < self.grid_size[0] and 0 <= ny < self.grid_size[1]:
-                    if dirt_map[nx, ny] == 1 or self.known_mask[nx, ny] == 0:
-                        return self.frontier_bonus
-        return 0.0
-
-    def _rotation_shaping(self, action, pos, orient, dirt_map, known_map):
-        facing_bonus = 0.0
-        spin_penalty = 0.0
-        if action in [1, 2]:
-            facing_bonus += self._facing_bonus(pos, orient, dirt_map)
-            dx, dy = self.orientations[orient]
-            tx, ty = pos[0] + dx, pos[1] + dy
-            if 0 <= tx < self.grid_size[0] and 0 <= ty < self.grid_size[1]:
-                if known_map[tx, ty] == 1:
-                    facing_bonus += 0.3
-
-        if len(self.action_history) == self.action_history.maxlen:
-            if sum(1 for a in self.action_history if a in [1, 2]) >= 4:
-                spin_penalty = self.meaningless_turn_penalty
-
-        return facing_bonus + spin_penalty, facing_bonus, spin_penalty
-
-    def _facing_bonus(self, pos, orient, dirt_map):
-        dx, dy = self.orientations[orient]
-        tx, ty = pos[0] + dx, pos[1] + dy
-        if not (0 <= tx < self.grid_size[0] and 0 <= ty < self.grid_size[1]):
-            return 0.0
-        if dirt_map[tx, ty] == 1:
-            return self.facing_bonus_dirty
-        if self.known_mask[tx, ty] == 0:
-            return self.facing_bonus_unknown
-        return 0.0
-
-    def _obstacle_ahead(self):
-        dx, dy = self.env.unwrapped.orientations[self.env.unwrapped.agent_orient]
-        tx = self.env.unwrapped.agent_pos[0] + dx
-        ty = self.env.unwrapped.agent_pos[1] + dy
-        if not (0 <= tx < self.grid_size[0] and 0 <= ty < self.grid_size[1]):
-            return True
-        return self.env.unwrapped.known_obstacle_map[tx, ty] == 1
 
 
 class SmartExplorationWrapper(gym.Wrapper):

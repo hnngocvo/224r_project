@@ -1,0 +1,249 @@
+{
+    "best_value": -Infinity,
+    "best_params": {
+        "wrapper_type": "smart",
+        "batch_size": 256
+    },
+    "all_trials": [
+        {
+            "number": 0,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 256
+            }
+        },
+        {
+            "number": 1,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 1024
+            }
+        },
+        {
+            "number": 2,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 1024
+            }
+        },
+        {
+            "number": 3,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 128
+            }
+        },
+        {
+            "number": 4,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 256
+            }
+        },
+        {
+            "number": 5,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 128
+            }
+        },
+        {
+            "number": 6,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 256
+            }
+        },
+        {
+            "number": 7,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 512
+            }
+        },
+        {
+            "number": 8,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 512
+            }
+        },
+        {
+            "number": 9,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 512
+            }
+        },
+        {
+            "number": 10,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 256
+            }
+        },
+        {
+            "number": 11,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 1024
+            }
+        },
+        {
+            "number": 12,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 1024
+            }
+        },
+        {
+            "number": 13,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 256
+            }
+        },
+        {
+            "number": 14,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 1024
+            }
+        },
+        {
+            "number": 15,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 1024
+            }
+        },
+        {
+            "number": 16,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 256
+            }
+        },
+        {
+            "number": 17,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 128
+            }
+        },
+        {
+            "number": 18,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 1024
+            }
+        },
+        {
+            "number": 19,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 256
+            }
+        },
+        {
+            "number": 20,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 1024
+            }
+        },
+        {
+            "number": 21,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 1024
+            }
+        },
+        {
+            "number": 22,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 1024
+            }
+        },
+        {
+            "number": 23,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 1024
+            }
+        },
+        {
+            "number": 24,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 1024
+            }
+        },
+        {
+            "number": 25,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 256
+            }
+        },
+        {
+            "number": 26,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 128
+            }
+        },
+        {
+            "number": 27,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 512
+            }
+        },
+        {
+            "number": 28,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 1024
+            }
+        },
+        {
+            "number": 29,
+            "value": -Infinity,
+            "params": {
+                "wrapper_type": "smart",
+                "batch_size": 128
+            }
+        }
+    ]
+}

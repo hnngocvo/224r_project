@@ -7,10 +7,8 @@ import json
 from datetime import datetime
 import gymnasium as gym
 from gymnasium.wrappers import TimeLimit
-from gymnasium.wrappers import RecordEpisodeStatistics
 from env import VacuumEnv
-from wrappers import ExplorationBonusWrapper, ExploitationPenaltyWrapper
-from run import generate_1b1b_layout_grid
+from wrappers import DumbWrapper, SmartExplorationWrapper
 from eval import MetricWrapper
 
 # Base directory for all Optuna studies
@@ -20,32 +18,35 @@ os.makedirs(OPTUNA_STUDIES_DIR, exist_ok=True)
 # Register the environment
 gym.register(id="Vacuum-v0", entry_point="env:VacuumEnv")
 
-def make_env(grid_size=(40, 30), use_layout=True, max_steps=3000, dirt_num=5):
+def make_env(grid_size=(20, 20), max_steps=3000, dirt_num=5, wrapper_type='dumb'):
     """Create a wrapped vacuum environment with specified parameters.
     
     Args:
         grid_size (tuple): Size of the grid (width, height)
-        use_layout (bool): Whether to use predefined layout (only for 40x30)
         max_steps (int): Maximum steps per episode
         dirt_num (int): Number of dirt clusters to place
+        wrapper_type (str): Type of exploration wrapper ('dumb' or 'smart')
     
     Returns:
         callable: A function that creates and returns the wrapped environment
     """
-    walls = generate_1b1b_layout_grid() if use_layout and grid_size == (40, 30) else None
     
     def _env():
         env = gym.make("Vacuum-v0", 
                       grid_size=grid_size, 
-                      render_mode="plot",
-                      dirt_num=dirt_num,
-                      use_counter=False)  # Disable internal counter since we use wrappers
+                      dirt_num=dirt_num)
         env = TimeLimit(env, max_episode_steps=max_steps)
-        env = ExplorationBonusWrapper(env, bonus=0.3)  # Will be overridden by trial params
-        env = ExploitationPenaltyWrapper(env, time_penalty=-0.002, stay_penalty=-0.1)  # Will be overridden
-        env = MetricWrapper(env)  # Add metrics wrapper for proper evaluation
-        if walls is not None:
-            env.reset(options={"walls": walls})
+        
+        # Apply chosen wrapper
+        if wrapper_type == 'smart':
+            env = SmartExplorationWrapper(env)
+        else:
+            env = DumbWrapper(env)
+            
+        env = MetricWrapper(env)
+        
+        # Use random walls by passing empty list to trigger random room generation
+        env.reset(options={"walls": []})
         return env
     
     return _env
@@ -57,21 +58,13 @@ def objective(trial):
     trial_dir = os.path.join(study_dir, f'trial_{trial.number}')
     os.makedirs(trial_dir, exist_ok=True)
     
-    # Hyperparameters to tune
+    # Focus on the 5 most impactful hyperparameters + wrapper choice
     params = {
-        'lr': trial.suggest_float('lr', 1e-5, 1e-3, log=True),
-        'batch_size': trial.suggest_int('batch_size', 16, 128, step=16),
-        'gamma': trial.suggest_float('gamma', 0.9, 0.99),
-        'n_atoms': trial.suggest_int('n_atoms', 21, 71, step=10),
-        'v_min': trial.suggest_float('v_min', -20, -5),
-        'v_max': trial.suggest_float('v_max', 5, 20),
-        'n_step': trial.suggest_int('n_step', 1, 5),
-        'alpha': trial.suggest_float('alpha', 0.4, 0.8),
-        'beta': trial.suggest_float('beta', 0.3, 0.7),
-        'beta_increment': trial.suggest_float('beta_increment', 0.0005, 0.002),
-        'exploration_bonus': trial.suggest_float('exploration_bonus', 0.1, 0.5),
-        'time_penalty': trial.suggest_float('time_penalty', -0.005, -0.001),
-        'stay_penalty': trial.suggest_float('stay_penalty', -0.2, -0.05)
+        'wrapper_type': trial.suggest_categorical('wrapper_type', ['dumb', 'smart']),
+        'lr': trial.suggest_float('lr', 1e-5, 5e-4, log=True),
+        'gamma': trial.suggest_float('gamma', 0.95, 0.995),
+        'batch_size': trial.suggest_categorical('batch_size', [32, 64, 128]),
+        'n_step': trial.suggest_categorical('n_step', [1, 3, 5])
     }
     
     # Save hyperparameters
@@ -79,72 +72,93 @@ def objective(trial):
         json.dump(params, f, indent=4)
     
     try:
-        # Override global variables in rainbow_dqn.py
+        # Override global variables in rainbow_dqn.py (only the ones we're tuning)
         import rainbow_dqn as rdqn
-        rdqn.LR = params['lr']
+        rdqn.LR = 0.0004067366522568581
         rdqn.BATCH_SIZE = params['batch_size']
-        rdqn.GAMMA = params['gamma']
-        rdqn.N_ATOMS = params['n_atoms']
-        rdqn.V_MIN = params['v_min']
-        rdqn.V_MAX = params['v_max']
-        rdqn.N_STEP = params['n_step']
-        rdqn.ALPHA = params['alpha']
-        rdqn.BETA = params['beta']
-        rdqn.BETA_INCREMENT = params['beta_increment']
+        rdqn.GAMMA = 0.9619576978096083
+        rdqn.N_STEP = 1
         
-        # Environment parameters
-        grid_size = (40, 30)
-        total_timesteps = 100000
-        eval_episodes = 5
+        # Environment parameters - optimized for 20x20 grid with random walls and 5 dirt spots
+        grid_size = (20, 20)
+        total_timesteps = 300000  # Target for promising trials
+        eval_episodes = 5  # More episodes for reliable evaluation
         max_steps = 3000
         dirt_num = 5
-        use_layout = True
         
         # Create environment factory with consistent settings
         env_fn = make_env(
             grid_size=grid_size,
-            use_layout=use_layout,
             max_steps=max_steps,
-            dirt_num=dirt_num
+            dirt_num=dirt_num,
+            wrapper_type=params['wrapper_type']
         )
         
         # Create training and eval environments from the same factory
         train_env = env_fn()
         eval_env = env_fn()  # This ensures same layout and settings
         
-        # Update environment wrappers with trial-specific parameters
-        for env in [train_env, eval_env]:
-            env.env.exploration_bonus = params['exploration_bonus']  # type: ignore
-            env.env.time_penalty = params['time_penalty']  # type: ignore
-            env.env.stay_penalty = params['stay_penalty']  # type: ignore
-        
-        # Create training directory
+        # Create training and evaluation directories
         train_dir = os.path.join(trial_dir, 'training')
-        os.makedirs(train_dir, exist_ok=True)
-        
-        # Train the model with custom log directory
-        model = train(
-            env=train_env,
-            grid_size=grid_size,
-            total_timesteps=total_timesteps,
-            save_freq=total_timesteps,  # Only save at the end
-            from_scratch=True,  # Always start fresh
-            custom_log_dir=train_dir  # Use trial-specific directory
-        )
-        
-        # Create evaluation directory
         eval_dir = os.path.join(trial_dir, 'evaluation')
+        os.makedirs(train_dir, exist_ok=True)
         os.makedirs(eval_dir, exist_ok=True)
         
-        # Evaluate the model with custom log directory
+        # Train the model with intermediate reporting for pruning
+        # We'll modify this to report intermediate rewards every 50k steps
+        intermediate_rewards = []
+        checkpoint_steps = 50000  # Report every 50k steps
+        
+        for checkpoint in range(1, (total_timesteps // checkpoint_steps) + 1):
+            current_steps = checkpoint * checkpoint_steps
+            
+            # Train for this checkpoint
+            model = train(
+                env=train_env,
+                grid_size=grid_size,
+                total_timesteps=current_steps,
+                save_freq=current_steps,  # Only save at the end of each checkpoint
+                output_dir=train_dir,
+                wrapper=params['wrapper_type']
+            )
+            
+            # Quick evaluation to get intermediate performance
+            quick_metrics = evaluate(
+                model,
+                env=eval_env,
+                grid_size=grid_size,
+                episodes=2,  # Quick evaluation with fewer episodes
+                render=False,
+                output_dir=eval_dir,
+                wrapper=params['wrapper_type']
+            )
+            
+            intermediate_reward = np.mean(quick_metrics['episode_rewards'])
+            intermediate_rewards.append(intermediate_reward)
+            
+            # Report to Optuna for pruning decision
+            trial.report(intermediate_reward, checkpoint - 1)
+            
+            # Check if trial should be pruned
+            if trial.should_prune():
+                print(f"Trial {trial.number} pruned at {current_steps} steps with reward {intermediate_reward:.2f}")
+                train_env.close()
+                eval_env.close()
+                raise optuna.TrialPruned()
+        
+        # Final evaluation with full episodes
+        print(f"Trial {trial.number} completed full training")
         metrics = evaluate(
             model,
             env=eval_env,
             grid_size=grid_size,
             episodes=eval_episodes,
-            render=False,  # No need to render during tuning
-            custom_log_dir=eval_dir  # Use trial-specific directory
+            render=False,
+            output_dir=eval_dir,
+            wrapper=params['wrapper_type']
         )
+        
+
         
         # Calculate mean reward as the objective
         mean_reward = np.mean(metrics['episode_rewards'])
@@ -186,15 +200,20 @@ def main():
     # Create database in the study directory
     storage_name = f"sqlite:///{os.path.join(study_dir, 'study.db')}"
     
-    # Create and run study
+    # Create and run study with pruning
     study = optuna.create_study(
         study_name=study_name,
         storage=storage_name,
         direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=42)
+        sampler=optuna.samplers.TPESampler(seed=42),
+        pruner=optuna.pruners.MedianPruner(
+            n_startup_trials=5,  # Don't prune first 5 trials (need baseline)
+            n_warmup_steps=1,    # Wait 1 checkpoints before pruning
+            interval_steps=1     # Check for pruning every checkpoint
+        )
     )
     
-    n_trials = 20  # Adjust based on your computational resources
+    n_trials = 30  # Many trials with early pruning to stay within budget
     study.optimize(objective, n_trials=n_trials)
     
     # Print best trial information

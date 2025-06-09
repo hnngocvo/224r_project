@@ -16,7 +16,7 @@ import json
 import argparse
 from torch.utils.tensorboard import SummaryWriter
 from gymnasium.wrappers import TimeLimit
-from wrappers import SmartExplorationWrapper
+from wrappers import DumbWrapper, SmartExplorationWrapper
 from datetime import datetime
 
 
@@ -30,13 +30,13 @@ os.makedirs(BASE_LOG_DIR, exist_ok=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Training Constants
-MAX_STEPS = 2000  # Maximum steps per episode
-MAX_TIMESTEPS = 500000  # Maximum total timesteps for training
+MAX_STEPS = 3000  # Maximum steps per episode
+MAX_TIMESTEPS = 1000000  # Maximum total timesteps for training
 
-# Hyperparameters - Optimized for dense reward shaping
-GAMMA = 0.99  # Standard discount factor
-LR = 3e-4  # Higher learning rate for dense rewards
-BATCH_SIZE = 32  # Smaller batches for more frequent updates
+# Hyperparameters - Optimized based on Optuna study (Trial 12: -104.76 ± 57.07)
+GAMMA = 0.9619576978096083  # Optimized discount factor
+LR = 0.0004067366522568581  # Optimized learning rate
+BATCH_SIZE = 256  # Optimized batch size (256 can cause numerical instability)
 BUFFER_SIZE = int(1e5)
 START_TRAINING = 200  # Start training earlier with dense rewards
 EPSILON_DECAY = 0.995
@@ -163,8 +163,8 @@ class RainbowDQN(nn.Module):
         # Combine value and advantage
         q_dist = value + advantage - advantage.mean(dim=1, keepdim=True)
         
-        # Get probabilities
-        return F.softmax(q_dist, dim=2)
+        # Get probabilities with numerical stability
+        return F.softmax(q_dist, dim=2) + 1e-8  # Add small epsilon to prevent exact zeros
 
     def reset_noise(self):
         self.advantage_hidden.reset_noise()
@@ -379,49 +379,6 @@ def project_distribution(next_dist, rewards, dones, support, delta_z, gamma):
             
     return proj_dist
 
-def rollout_and_record(env, policy_net, filename="rainbow_run.mp4", max_steps=MAX_STEPS, walls=None, temperature=1.0):
-    """
-    Record a video of the agent's performance in a NEW episode.
-    
-    WARNING: This creates a NEW episode with env.reset() - use only for standalone recording!
-    For evaluation videos, the evaluate() function now records during the actual episode.
-    """
-    print(f"\nRecording video for {max_steps} steps...")
-    obs, _ = env.reset(options={"walls": walls})
-    frames = []
-
-    for step in range(max_steps):
-        # Render and save frame
-        fig = env.unwrapped.render_frame()
-        frames.append(fig)
-
-        # Get action from policy using sampling
-        action = policy_net.act(obs, epsilon=0.0, temperature=temperature)
-        obs, _, terminated, truncated, _ = env.step(action)
-
-        if terminated or truncated:
-            break
-
-    print(f"Recorded {len(frames)} frames")
-    
-    # Create animation
-    fig, ax = plt.subplots()
-    im = ax.imshow(frames[0])
-    ax.axis("off")
-
-    def update(i):
-        im.set_array(frames[i])
-        return [im]
-
-    ani = animation.FuncAnimation(
-        fig, update, frames=len(frames), interval=100, blit=True
-    )
-
-    # Save animation
-    ani.save(filename, writer="ffmpeg")
-    plt.close(fig)
-    print(f"Video saved to: {filename}")
-
 def plot_training_metrics(metrics: Dict[str, List[float]], log_dir: str):
     """Plot and save training metrics"""
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
@@ -517,26 +474,29 @@ def load_model(model, full_load_path):
         print(f"\nNo saved model found at: {full_load_path}")
         return None
 
-def get_log_dir(grid_size, custom_dir=None):
-    """Create and return log directory based on grid size or custom directory.
+def get_log_dir(grid_size, dirt_num=5, wall_mode="none", custom_dir=None):
+    """Create and return log directory with descriptive naming convention.
     
     Args:
         grid_size (tuple): Grid dimensions
+        dirt_num (int): Number of dirt clusters
+        wall_mode (str): Wall configuration ("none", "random", "hardcoded")
         custom_dir (str, optional): Custom directory path to use instead of default
     """
     if custom_dir is not None:
         log_dir = custom_dir
     else:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        log_dir = os.path.join(BASE_LOG_DIR, f"rainbow_dqn_{grid_size[0]}x{grid_size[1]}_{timestamp}")
+        log_dir = os.path.join(BASE_LOG_DIR, f"rainbow_dqn_{grid_size[0]}x{grid_size[1]}_dirt_{dirt_num}_{wall_mode}_{timestamp}")
     
     os.makedirs(log_dir, exist_ok=True)
     return log_dir
 
-def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps: int = MAX_TIMESTEPS, save_freq: int = 10000, walls=None, env=None, seed=None, output_dir: str = None, dirt_num: int = 5):
+def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps: int = MAX_TIMESTEPS, save_freq: int = 10000, walls=None, env=None, seed=None, output_dir: str = None, dirt_num: int = 5, wrapper: str = 'smart'):
     if output_dir is None:
         # Fallback if no output_dir is provided, though __main__ should provide it.
-        output_dir = get_log_dir(grid_size)
+        wall_mode_name = "hardcoded" if walls is not None and walls != "" else ("random" if walls == "" else "none")
+        output_dir = get_log_dir(grid_size, dirt_num, wall_mode_name)
     else:
         os.makedirs(output_dir, exist_ok=True) # Ensure it exists if provided
     
@@ -558,17 +518,76 @@ def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps:
     writer = SummaryWriter(os.path.join(output_dir, 'tensorboard'))
     print(f"TensorBoard logs will be saved to: {os.path.join(output_dir, 'tensorboard')}")
     
+    # Save metadata file with training command and evaluation command
+    metadata_file = os.path.join(output_dir, "metadata.txt")
+    with open(metadata_file, "w") as f:
+        f.write("Training Metadata\n")
+        f.write("=================\n\n")
+        
+        # Original training command
+        import sys
+        original_command = " ".join(sys.argv)
+        f.write(f"Training Command:\n{original_command}\n\n")
+        
+        # Evaluation commands for different models
+        eval_best = f"python rainbow_dqn.py --mode eval --model_path \"{os.path.join(output_dir, 'best_model.pth')}\" --grid_size {grid_size[0]} {grid_size[1]} --dirt_num {dirt_num}"
+        eval_final = f"python rainbow_dqn.py --mode eval --model_path \"{os.path.join(output_dir, 'final_model.pth')}\" --grid_size {grid_size[0]} {grid_size[1]} --dirt_num {dirt_num}"
+        
+        # Add wall mode if applicable
+        if walls is not None and walls != "":
+            wall_mode_name = "hardcoded" if walls != "" else "random"
+            eval_best += f" --wall_mode {wall_mode_name}"
+            eval_final += f" --wall_mode {wall_mode_name}"
+        elif walls == "":
+            eval_best += " --wall_mode random"
+            eval_final += " --wall_mode random"
+        
+        # Add evaluation episodes and temperature (common settings)
+        eval_best += " --eval_episodes 5 --temperature 1.0"
+        eval_final += " --eval_episodes 5 --temperature 1.0"
+        
+        f.write("Evaluation Commands:\n")
+        f.write("-------------------\n")
+        f.write(f"Best Model:\n{eval_best}\n\n")
+        f.write(f"Final Model:\n{eval_final}\n\n")
+        
+        # Training configuration summary
+        f.write("Configuration Summary:\n")
+        f.write("---------------------\n")
+        f.write(f"Grid Size: {grid_size[0]}x{grid_size[1]}\n")
+        f.write(f"Dirt Clusters: {dirt_num}\n")
+        wall_mode_display = "None" if walls is None else ("Random" if walls == "" else "Hardcoded")
+        f.write(f"Wall Mode: {wall_mode_display}\n")
+        f.write(f"Total Timesteps: {total_timesteps}\n")
+        f.write(f"Max Steps per Episode: {MAX_STEPS}\n")
+        f.write(f"Random Seed: {seed}\n")
+        f.write(f"Training Device: {device}\n")
+        f.write(f"Learning Rate: {LR}\n")
+        f.write(f"Batch Size: {BATCH_SIZE}\n")
+        f.write(f"Buffer Size: {BUFFER_SIZE}\n")
+        
+    print(f"Metadata saved to: {metadata_file}")
+    
     # Create environment if not provided
     if env is None:
         # Create and wrap environment with metrics and additional wrappers
         env = gym.make(env_id, grid_size=grid_size, dirt_num=dirt_num)
         env = TimeLimit(env, max_episode_steps=MAX_STEPS)
-        env = SmartExplorationWrapper(env)  # Intelligent reward shaping
+        
+        # Apply chosen wrapper
+        if wrapper == 'smart':
+            env = SmartExplorationWrapper(env)  # Advanced dense rewards
+        else:
+            env = DumbWrapper(env)  # Simple reward shaping
+            
         env = MetricWrapper(env)
     
     print("\nEnvironment Wrappers:")
     print(f"- TimeLimit: {MAX_STEPS} steps")
-    print("- SmartExploration: Intelligent reward shaping enabled")
+    if wrapper == 'smart':
+        print("- SmartExplorationWrapper: Advanced dense rewards enabled")
+    else:
+        print("- DumbWrapper: Simple reward shaping enabled")
     print("- MetricWrapper: enabled")
     
     # Initialize metrics dictionary
@@ -755,14 +774,27 @@ def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps:
                         GAMMA
                     )
 
-                loss = -(target_q_dist * current_q_dist.log()).sum(1)
+                # Add epsilon to prevent log(0) which causes NaN
+                eps = 1e-8
+                log_current_q_dist = torch.clamp(current_q_dist, min=eps).log()
+                loss = -(target_q_dist * log_current_q_dist).sum(1)
+                
+                # Check for NaN in loss and handle it
+                if torch.isnan(loss).any() or torch.isinf(loss).any():
+                    print("Warning: NaN or Inf detected in loss, skipping this batch")
+                    continue
                 
                 # Convert to priorities with safety checks for NaN/inf values
                 priorities = loss.detach().cpu().numpy()
                 priorities = np.where(np.isfinite(priorities), priorities, 1e-8)
                 priorities = np.maximum(priorities, 1e-8)  # Ensure all priorities are positive
                 
-                loss = (loss * weights).mean()
+                weighted_loss = loss * weights
+                if torch.isnan(weighted_loss).any() or torch.isinf(weighted_loss).any():
+                    print("Warning: NaN or Inf detected in weighted loss, skipping this batch")
+                    continue
+                    
+                loss = weighted_loss.mean()
                 
                 # Log training loss to TensorBoard
                 writer.add_scalar('Train/Loss', loss.item(), step)
@@ -772,8 +804,21 @@ def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps:
 
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 10)
+                
+                # Check for NaN gradients before stepping
+                grad_norm = torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 10)
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    print("Warning: NaN or Inf detected in gradients, skipping optimizer step")
+                    continue
+                    
                 optimizer.step()
+                
+                # Validate network parameters after update
+                for name, param in policy_net.named_parameters():
+                    if torch.isnan(param).any() or torch.isinf(param).any():
+                        print(f"Warning: NaN or Inf detected in parameter {name}, stopping training")
+                        print("Network has become unstable. Consider reducing learning rate or batch size.")
+                        return policy_net
 
                 buffer.update_priorities(indices, priorities)
 
@@ -808,10 +853,11 @@ def train(env_id: str = "Vacuum-v0", grid_size: tuple = (6, 6), total_timesteps:
     env.close()
     return policy_net
 
-def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=1, render=True, walls=None, env=None, output_dir: str = None, dirt_num: int = 5, temperature: float = 1.0):
+def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=1, render=True, walls=None, env=None, output_dir: str = None, dirt_num: int = 5, temperature: float = 1.0, wrapper: str = 'smart'):
     if output_dir is None:
         # Fallback if no output_dir is provided, though __main__ should provide it.
-        output_dir = get_log_dir(grid_size)
+        wall_mode_name = "hardcoded" if walls is not None and walls != "" else ("random" if walls == "" else "none")
+        output_dir = get_log_dir(grid_size, dirt_num, wall_mode_name)
     else:
         os.makedirs(output_dir, exist_ok=True) # Ensure it exists if provided
 
@@ -830,19 +876,22 @@ def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=1, rende
         # Create and wrap environment with same wrappers as training
         env = gym.make(env_id, grid_size=grid_size, dirt_num=dirt_num)
         env = TimeLimit(env, max_episode_steps=MAX_STEPS)
-        env = SmartExplorationWrapper(env)  # Intelligent reward shaping
+        
+        # Apply chosen wrapper
+        if wrapper == 'smart':
+            env = SmartExplorationWrapper(env)  # Advanced dense rewards
+        else:
+            env = DumbWrapper(env)  # Simple reward shaping
+            
         # env = ExploitationPenaltyWrapper(env, time_penalty=-0.0020989802390739463, stay_penalty=-0.05073560696895504)  # From Optuna study
         env = MetricWrapper(env)
     
     print("\nEnvironment Wrappers:")
     print(f"- TimeLimit: {MAX_STEPS} steps")
-    print("- SmartExploration: Intelligent reward shaping enabled")
-    print("  * New cell bonus: +0.2")
-    print("  * Wall turn bonus: +0.5") 
-    print("  * Home progress bonus: +0.1")
-    print("  * Spinning penalty: -0.5")
-    print("  * Flip-flop penalty: -0.2")
-    print(f"- ExploitationPenalty: time={-0.0020989802390739463}, stay={-0.05073560696895504}")  # From Optuna study
+    if wrapper == 'smart':
+        print("- SmartExplorationWrapper: Advanced dense rewards enabled")
+    else:
+        print("- DumbWrapper: Simple reward shaping enabled")
     print("- MetricWrapper: enabled")
     print("- Internal stuck counter: disabled")
     
@@ -856,26 +905,43 @@ def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=1, rende
         "coverage_ratio": [],
         "path_efficiency": [],
         "revisit_ratio": [],
-        "cleaning_time": []
+        "cleaning_time": [],
+        "action_distributions": []  # Store action distribution for each episode
     }
 
-    # Evaluate the last few episodes in reverse order
-    for ep in range(episodes - 1, -1, -1):
-        print_section_header(f"Evaluation Episode {episodes - ep}")
+    # Evaluate episodes in normal order
+    for ep in range(episodes):
+        print_section_header(f"Evaluation Episode {ep + 1}")
+        
+        # Memory debug info
+        import gc
+        print(f"Memory before episode: {len(gc.get_objects())} objects in memory")
+        
         obs, _ = env.reset(options={"walls": walls})
         done = False
         total_reward = 0
         steps = 0
         eval_action_counts = [0, 0, 0]  # Track actions in this episode
         
-        # Initialize video recording for this episode
+        # Initialize rendering - collect frames for video AND save final frame
         frames = [] if render else None
+        final_frame = None
 
         while not done:
-            # Record frame before taking action (if rendering)
+            # Record frame for both video and final image
             if render:
-                fig = env.unwrapped.render_frame()
-                frames.append(fig)
+                try:
+                    frame_data = env.unwrapped.render_frame()
+                    frames.append(frame_data)
+                    final_frame = frame_data  # Always keep the latest as final frame
+                    
+                    # Limit frames to prevent excessive memory usage
+                    if len(frames) > 800:  # Reduced limit for safety
+                        print(f"Warning: Episode too long ({len(frames)} frames), stopping video recording")
+                        render = False
+                except Exception as e:
+                    print(f"Warning: Failed to render frame at step {steps}: {e}")
+                    render = False  # Disable rendering for the rest of this episode
             
             # Use deterministic actions during evaluation (no noise, no epsilon)
             with torch.no_grad():  # Ensure no gradients during evaluation
@@ -887,9 +953,32 @@ def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=1, rende
             total_reward += reward
             steps += 1
 
-        # Log metrics
+        # Calculate action distribution
+        total_eval_actions = sum(eval_action_counts)
+        if total_eval_actions > 0:
+            eval_action_dist = [count/total_eval_actions for count in eval_action_counts]
+        else:
+            eval_action_dist = [0.0, 0.0, 0.0]  # Default if no actions taken
+
+        # Log metrics to dictionary
+        episode_metrics = {
+            "episode": ep + 1,
+            "steps": steps,
+            "total_reward": total_reward,
+            "action_distribution": {
+                "forward": eval_action_dist[0],
+                "left": eval_action_dist[1], 
+                "right": eval_action_dist[2]
+            },
+            "coverage_ratio": info.get('coverage_ratio', 0),
+            "path_efficiency": info.get('path_efficiency', 0),
+            "revisit_ratio": info.get('revisit_ratio', 0)
+        }
+        
+        # Store in main metrics lists
         metrics["episode_rewards"].append(total_reward)
         metrics["episode_lengths"].append(steps)
+        metrics["action_distributions"].append(eval_action_dist)
         if "coverage_ratio" in info:
             metrics["coverage_ratio"].append(info["coverage_ratio"])
             metrics["path_efficiency"].append(info["path_efficiency"])
@@ -898,37 +987,89 @@ def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=1, rende
         print("\nEpisode Results:")
         print(f"Steps: {steps}")
         print(f"Total Reward: {total_reward:.2f}")
-        total_eval_actions = sum(eval_action_counts)
         if total_eval_actions > 0:
-            eval_action_dist = [count/total_eval_actions for count in eval_action_counts]
             print(f"Action Distribution - Forward: {eval_action_dist[0]:.2%}, Left: {eval_action_dist[1]:.2%}, Right: {eval_action_dist[2]:.2%}")
         print("\nCleaning Metrics:")
         print(f"Coverage: {info.get('coverage_ratio', 0):.2%}")
         print(f"Path Efficiency: {info.get('path_efficiency', 0):.2f}")
         print(f"Revisit Ratio: {info.get('revisit_ratio', 0):.2f}")
         
-        # Save video from the actual episode frames
+        # Save individual episode metrics to separate file
+        episode_metrics_file = os.path.join(output_dir, f"episode_{ep + 1}_metrics.json")
+        with open(episode_metrics_file, "w") as f:
+            json.dump(episode_metrics, f, indent=2)
+        print(f"Episode metrics saved to: {episode_metrics_file}")
+        
+        # Save video from collected frames (even single frame episodes)
         if render and frames:
-            video_path = os.path.join(output_dir, f"eval_ep_{episodes - ep}.mp4")
-            print(f"\nSaving video from {len(frames)} frames of the actual evaluation episode...")
+            video_path = os.path.join(output_dir, f"eval_ep_{ep + 1}.mp4")
+            print(f"\nCreating video from {len(frames)} frames...")
             
-            # Create animation from recorded frames
-            fig, ax = plt.subplots()
-            im = ax.imshow(frames[0])
-            ax.axis("off")
+            try:
+                fig, ax = plt.subplots(figsize=(8, 8), dpi=80)
+                im = ax.imshow(frames[0])
+                ax.axis("off")
+                ax.set_title(f"Episode {ep + 1} (Steps: {steps}, Reward: {total_reward:.1f})")
 
-            def update(i):
-                im.set_array(frames[i])
-                return [im]
+                def update(i):
+                    im.set_array(frames[i])
+                    return [im]
 
-            ani = animation.FuncAnimation(
-                fig, update, frames=len(frames), interval=100, blit=True
-            )
+                ani = animation.FuncAnimation(
+                    fig, update, frames=len(frames), interval=100, blit=True
+                )
 
-            # Save animation
-            ani.save(video_path, writer="ffmpeg")
-            plt.close(fig)
-            print(f"Video saved to: {video_path}")
+                # Save with optimized settings
+                ani.save(video_path, writer="ffmpeg", fps=10, bitrate=1000)
+                plt.close(fig)
+                print(f"Video saved to: {video_path}")
+                
+            except Exception as e:
+                print(f"Warning: Failed to create video: {e}")
+                plt.close('all')
+        else:
+            print(f"\nNo frames collected for episode {ep + 1} - skipping video")
+        
+        # Save final frame as static image
+        if final_frame is not None:
+            image_path = os.path.join(output_dir, f"eval_ep_{ep + 1}_final.png")
+            print(f"Saving final frame...")
+            
+            try:
+                plt.figure(figsize=(8, 8))
+                plt.imshow(final_frame)
+                plt.axis("off")
+                plt.title(f"Episode {ep + 1} Final State (Steps: {steps}, Reward: {total_reward:.1f})")
+                plt.savefig(image_path, bbox_inches="tight", pad_inches=0, dpi=150)
+                plt.close()
+                print(f"Final frame saved to: {image_path}")
+                
+            except Exception as e:
+                print(f"Warning: Failed to save final frame: {e}")
+                plt.close('all')
+        
+        # Aggressive memory cleanup
+        if frames:
+            # Clear references to frame data
+            for i in range(len(frames)):
+                frames[i] = None
+            frames.clear()
+            del frames
+        
+        # Clear final frame reference
+        if final_frame is not None:
+            final_frame = None
+            del final_frame
+        
+        # Force matplotlib cleanup
+        plt.close('all')
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+        
+        # Memory debug info
+        print(f"Memory after episode cleanup: {len(gc.get_objects())} objects in memory")
 
     # Calculate and print summary statistics
     print_section_header("Evaluation Summary")
@@ -944,11 +1085,37 @@ def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=1, rende
     
     print_metrics(summary_metrics)
 
-    # Save evaluation metrics
+    # Save evaluation metrics with detailed breakdown
     metrics_file = os.path.join(output_dir, "evaluation_metrics.json")
+    
+    # Add detailed episode-by-episode breakdown to main metrics
+    detailed_metrics = metrics.copy()
+    detailed_metrics["episodes_detail"] = []
+    
+    for i in range(episodes):
+        episode_detail = {
+            "episode": i + 1,
+            "steps": metrics["episode_lengths"][i],
+            "total_reward": metrics["episode_rewards"][i],
+            "action_distribution": {
+                "forward": metrics["action_distributions"][i][0],
+                "left": metrics["action_distributions"][i][1],
+                "right": metrics["action_distributions"][i][2]
+            }
+        }
+        
+        # Add cleaning metrics if available
+        if i < len(metrics["coverage_ratio"]):
+            episode_detail["coverage_ratio"] = metrics["coverage_ratio"][i]
+            episode_detail["path_efficiency"] = metrics["path_efficiency"][i]
+            episode_detail["revisit_ratio"] = metrics["revisit_ratio"][i]
+        
+        detailed_metrics["episodes_detail"].append(episode_detail)
+    
     with open(metrics_file, "w") as f:
-        json.dump(metrics, f)
-    print(f"\nMetrics saved to: {metrics_file}")
+        json.dump(detailed_metrics, f, indent=2)
+    print(f"\nDetailed evaluation metrics saved to: {metrics_file}")
+    print(f"Individual episode files: episode_1_metrics.json, episode_2_metrics.json, ...")
 
     env.close()
     return metrics
@@ -973,6 +1140,8 @@ if __name__ == "__main__":
                       help='Number of dirt clusters to generate (0 means all non-obstacle tiles are dirt)')
     parser.add_argument('--temperature', type=float, default=1.0,
                       help='Temperature for action sampling during evaluation (1.0=normal, >1.0=more random, <1.0=more deterministic)')
+    parser.add_argument('--wrapper', choices=['dumb', 'smart'], default='smart',
+                      help='Exploration wrapper to use: "dumb" (minimal rewards) or "smart" (advanced dense rewards)')
     args = parser.parse_args()
 
     grid_size = tuple(args.grid_size)
@@ -990,14 +1159,64 @@ if __name__ == "__main__":
         # Keep walls = None to skip wall generation entirely
         walls = None
 
-    # Determine log directory for this run
-    run_log_dir = get_log_dir(grid_size)
-    print(f"All outputs for this run will be saved to: {run_log_dir}")
+    if args.mode == 'train':
+        # Training mode: train a new model then evaluate it
+        wall_mode_name = "hardcoded" if args.wall_mode == 'hardcoded' else ("random" if args.wall_mode == 'random' else "none")
+        run_log_dir = get_log_dir(grid_size, args.dirt_num, wall_mode_name)
+        print(f"All outputs for this run will be saved to: {run_log_dir}")
 
-    # Train a new model
-    model = train(total_timesteps=args.timesteps, grid_size=grid_size, walls=walls, 
-                    seed=args.seed, output_dir=run_log_dir, dirt_num=args.dirt_num)
-    # Evaluate the trained model
-    evaluate(model, grid_size=grid_size, episodes=args.eval_episodes, walls=walls, 
-            output_dir=run_log_dir, dirt_num=args.dirt_num, temperature=args.temperature)
+        # Train a new model
+        model = train(total_timesteps=args.timesteps, grid_size=grid_size, walls=walls, 
+                        seed=args.seed, output_dir=run_log_dir, dirt_num=args.dirt_num, wrapper=args.wrapper)
+        # Evaluate the trained model
+        evaluate(model, grid_size=grid_size, episodes=args.eval_episodes, walls=walls, 
+                output_dir=run_log_dir, dirt_num=args.dirt_num, temperature=args.temperature, wrapper=args.wrapper)
+    
+    elif args.mode == 'eval':
+        # Evaluation mode: load existing model and evaluate only
+        print_section_header("Evaluation Mode - Loading Pre-trained Model")
+        
+        # Determine model path
+        if os.path.isabs(args.model_path):
+            model_path = args.model_path
+            eval_log_dir = os.path.dirname(model_path)
+        else:
+            # Relative path - look in logs directory or current directory
+            if os.path.exists(args.model_path):
+                model_path = args.model_path
+                eval_log_dir = os.path.dirname(os.path.abspath(model_path))
+            else:
+                # Try in logs directory
+                model_path = os.path.join("logs", args.model_path)
+                if not os.path.exists(model_path):
+                    print(f"Error: Model file not found at {args.model_path} or {model_path}")
+                    exit(1)
+                eval_log_dir = os.path.dirname(model_path)
+        
+        print(f"Loading model from: {model_path}")
+        print(f"Evaluation outputs will be saved to: {eval_log_dir}")
+        
+        # Create model architecture
+        obs_dim = {
+            'agent_orient': 1,
+            'knowledge_map': grid_size[0] * grid_size[1]
+        }
+        # We need to create a dummy environment to get the number of actions
+        dummy_env = gym.make("Vacuum-v0", grid_size=grid_size, dirt_num=args.dirt_num)
+        n_actions = dummy_env.action_space.n
+        dummy_env.close()
+        
+        model = RainbowDQN(obs_dim, n_actions).to(device)
+        
+        # Load the trained model
+        loaded_model = load_model(model, model_path)
+        if loaded_model is None:
+            print(f"Error: Failed to load model from {model_path}")
+            exit(1)
+        
+        model = loaded_model
+        
+        # Evaluate the loaded model
+        evaluate(model, grid_size=grid_size, episodes=args.eval_episodes, walls=walls, 
+                output_dir=eval_log_dir, dirt_num=args.dirt_num, temperature=args.temperature, wrapper=args.wrapper)
 
