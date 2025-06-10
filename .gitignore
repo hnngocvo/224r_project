@@ -12,7 +12,6 @@ logs/optuna_studies/rainbow_dqn_study_*/study.db
 logs/optuna_studies/rainbow_dqn_study_*/optimization_history.html
 logs/optuna_studies/rainbow_dqn_study_*/parallel_coordinate.html
 logs/optuna_studies/rainbow_dqn_study_*/param_importances.html
-logs/rainbow_dqn_40x30*
 logs/rainbow_dqn*/*.pth
 logs/rainbow_dqn*/tensorboard/
 

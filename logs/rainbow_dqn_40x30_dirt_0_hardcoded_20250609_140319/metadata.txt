@@ -1,0 +1,26 @@
+Training Metadata
+=================
+
+Training Command:
+rainbow_dqn.py --mode train --timesteps 1000000 --grid_size 40 30 --seed 42 --dirt_num 0 --eval_episodes 5 --wall_mode hardcoded
+
+Evaluation Commands:
+-------------------
+Best Model:
+python rainbow_dqn.py --mode eval --model_path "./logs\rainbow_dqn_40x30_dirt_0_hardcoded_20250609_140319\best_model.pth" --grid_size 40 30 --dirt_num 0 --wall_mode hardcoded --eval_episodes 5 --temperature 1.0
+
+Final Model:
+python rainbow_dqn.py --mode eval --model_path "./logs\rainbow_dqn_40x30_dirt_0_hardcoded_20250609_140319\final_model.pth" --grid_size 40 30 --dirt_num 0 --wall_mode hardcoded --eval_episodes 5 --temperature 1.0
+
+Configuration Summary:
+---------------------
+Grid Size: 40x30
+Dirt Clusters: 0
+Wall Mode: Hardcoded
+Total Timesteps: 1000000
+Max Steps per Episode: 3000
+Random Seed: 42
+Training Device: cuda
+Learning Rate: 0.0004067366522568581
+Batch Size: 256
+Buffer Size: 100000
