@@ -1,13 +1,13 @@
 {
   "episode": 4,
-  "steps": 253,
-  "total_reward": -117.05699999999997,
+  "steps": 135,
+  "total_reward": -94.20800000000013,
   "action_distribution": {
-    "forward": 0.16205533596837945,
-    "left": 0.49407114624505927,
-    "right": 0.3438735177865613
+    "forward": 0.9407407407407408,
+    "left": 0.022222222222222223,
+    "right": 0.037037037037037035
   },
-  "coverage_ratio": 0.058981233243967826,
-  "path_efficiency": 0.6809651474530831,
-  "revisit_ratio": 380.40157480314963
+  "coverage_ratio": 0.02425876010781671,
+  "path_efficiency": 0.3665768194070081,
+  "revisit_ratio": 734.0588235294117
 }

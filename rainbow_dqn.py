@@ -923,25 +923,35 @@ def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=1, rende
         steps = 0
         eval_action_counts = [0, 0, 0]  # Track actions in this episode
         
-        # Initialize rendering - collect frames for video AND save final frame
+        # Initialize rendering - separate video recording from final frame capture
         frames = [] if render else None
         final_frame = None
+        video_recording = render  # Track video recording separately from final frame
+        should_capture_final = render  # Always try to capture final frame
 
         while not done:
-            # Record frame for both video and final image
-            if render:
+            # Record frame for video (with limits)
+            if video_recording:
                 try:
                     frame_data = env.unwrapped.render_frame()
                     frames.append(frame_data)
-                    final_frame = frame_data  # Always keep the latest as final frame
                     
-                    # Limit frames to prevent excessive memory usage
-                    if len(frames) > 800:  # Reduced limit for safety
-                        print(f"Warning: Episode too long ({len(frames)} frames), stopping video recording")
-                        render = False
+                    # Limit frames to prevent excessive memory usage for video
+                    if len(frames) > 5000:  # Increased limit
+                        print(f"Warning: Episode too long ({len(frames)} frames), stopping video recording but continuing final frame capture")
+                        video_recording = False
                 except Exception as e:
-                    print(f"Warning: Failed to render frame at step {steps}: {e}")
-                    render = False  # Disable rendering for the rest of this episode
+                    print(f"Warning: Failed to render frame for video at step {steps}: {e}")
+                    video_recording = False
+            
+            # Always try to capture final frame (separate from video)
+            if should_capture_final and steps > 0 and steps % 50 == 0:  # Sample every 50 steps for final frame
+                try:
+                    final_frame = env.unwrapped.render_frame()
+                except Exception as e:
+                    if steps == 1:  # Only warn on first attempt
+                        print(f"Warning: Failed to render final frame at step {steps}: {e}")
+                        should_capture_final = False
             
             # Use deterministic actions during evaluation (no noise, no epsilon)
             with torch.no_grad():  # Ensure no gradients during evaluation
@@ -952,6 +962,14 @@ def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=1, rende
             
             total_reward += reward
             steps += 1
+
+        # Ensure we have a final frame (capture at end if not already captured)
+        if should_capture_final and final_frame is None:
+            try:
+                final_frame = env.unwrapped.render_frame()
+                print(f"Captured final frame at episode end (step {steps})")
+            except Exception as e:
+                print(f"Warning: Failed to capture final frame at episode end: {e}")
 
         # Calculate action distribution
         total_eval_actions = sum(eval_action_counts)
@@ -1001,7 +1019,7 @@ def evaluate(policy_net, env_id="Vacuum-v0", grid_size=(6, 6), episodes=1, rende
         print(f"Episode metrics saved to: {episode_metrics_file}")
         
         # Save video from collected frames (even single frame episodes)
-        if render and frames:
+        if frames and len(frames) > 0:
             video_path = os.path.join(output_dir, f"eval_ep_{ep + 1}.mp4")
             print(f"\nCreating video from {len(frames)} frames...")
             
